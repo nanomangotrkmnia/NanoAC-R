@@ -172,6 +172,49 @@ direction: if a solid wall sits within `Room` studs the knockback was physically
 skipped (hitting a wall is not anti-knockback). Reduced knockback is a top-tier BedWars edge
 (surviving near the void).
 
+---
+
+## 3b. The extended guards
+
+Added on top of the original checks; each is still one `Actor` containing one `Script`. All
+of them read the shared roster/config and push to the shared queue, exactly like the originals.
+
+| Guard | Folder | Thread | Detects |
+| --- | --- | --- | --- |
+| Movement | `Movement/Movement` | parallel | CFrame-walk / move-with-no-velocity: windowed displacement vs the integral of `AssemblyLinearVelocity`. |
+| FlyGuard | `Flight/FlyGuard` | parallel | PlatformStand fly / hover / illegal ascent (the states the FlightA-C checks exempt). |
+| SwimGuard | `Flight/SwimGuard` | parallel | swim-in-air: the `Swimming` state while `FloorMaterial ~= Water`. |
+| HumanoidGuard | `Player/HumanoidGuard` | parallel | WalkSpeed / JumpPower / JumpHeight / HipHeight / MaxSlopeAngle tamper vs the spawn baseline. |
+| StateGuard | `Player/StateGuard` | parallel | Flying / StrafingNoPhysics state, seatless fake `Sit`. |
+| IntegrityGuard | `Player/IntegrityGuard` | parallel | Dead/Freefall state disabled, Flying enabled (baseline-relative), extra Humanoids. |
+| NoclipGuard | `Player/NoclipGuard` | parallel | HumanoidRootPart `CanCollide` off, HRP `NoCollisionConstraint`. |
+| PhysicsGuard | `Player/PhysicsGuard` | parallel | Injected body movers / forces / constraints (`LineForce`, `BodyVelocity`, ...). |
+| HealthGuard | `Player/HealthGuard` | parallel | MaxHealth tamper, Health > MaxHealth, illegal heal bursts. |
+| HitboxGuard | `Player/HitboxGuard` | parallel | Inflated limbs / HRP / accessory handles vs the spawn baseline. |
+| FlingGuard | `Combat/Fling` | parallel | Extreme HRP angular / linear velocity used to fling players. |
+| Hit | `Combat/Hit` | parallel | Hit reach (+ping cushion), hit spam, kill-aura (too many distinct victims). LOS stays in `ThroughWall`. |
+| FireRate | `Combat/FireRate` | parallel | Shot-rate limits, fed by the `ReportShot` API. |
+| RemoteGuard | `Network/RemoteGuard` | serial sensor | Global + per-remote RemoteEvent spam, oversized/too-many-argument payloads. |
+| ToolGuard | `Network/ToolGuard` | serial sensor | Tool equip / activate spam; auto-hooks every Tool that enters a character. |
+| ExploitGuard | `Network/ExploitGuard` | serial sensor | Invocations of suspiciously-named remotes (`Checks.Exploit.Patterns`). |
+| BanManager | `Core/Coordinator` | serial | Strikes -> warn / kick, idle strike decay, whitelist, session (+optional DataStore) rejoin ban. |
+
+Notes:
+
+* The property guards (Humanoid / Integrity / Hitbox) compare against a **spawn baseline**
+  captured once per character, so engine defaults (e.g. non-collidable R15 limbs, a
+  default-enabled `Flying` *state enable*) never false-flag; only a change from what the
+  character spawned with is reported.
+* The modern R15 rig's `BallSocketConstraint` / `AnimationConstraint` / `RigidConstraint`
+  joints and accessory `NoCollisionConstraint`s are deliberately excluded from the physics /
+  noclip scans; only movers, `LineForce`-style actuators and HRP-parented noclip constraints
+  are counted.
+* New bindables under `NanoAC-R`: `ReportShot(player, weapon)`, `ReportHeal(player, amount)`
+  and `BanManager` (`Invoke("strike"|"whitelist"|"unban"|"isWhitelisted"|"isBanned", ...)`).
+* Gameplay that legitimately changes humanoid properties should either set them before the
+  spawn baseline is captured or whitelist the player (`BanManager` `whitelist` action / the
+  `NanoAC_Whitelisted` attribute), which exempts them from every check.
+
 ## 4. Combat reporting API
 
 ```lua
@@ -278,7 +321,7 @@ These were added to make the anti-cheat easy to exercise and are all easy to rev
 | Toggle | Value now | Production value |
 | --- | --- | --- |
 | `Alerts.EveryoneIsStaff` | `true` — every player receives threshold alerts | `false` |
-| `Setback.OnEveryFlag` | `true` — ANY flag triggers a setback, not just threshold crossings | `false` |
+| `Setback.OnEveryFlag` | `true` — ANY flag triggers a setback, not just threshold crossings | `true` (default) |
 | `Setback.FreezeSafeSpotOnFlag` | `true` — stop advancing the safe spot while a player is flagged | keep / optional |
 | `Setback.Cooldown` | `0.2s` | `1.5s` |
 | `Grace.AfterSetback` | `0.25s` — short check-blindness after a setback | `1.0s` |
@@ -286,12 +329,14 @@ These were added to make the anti-cheat easy to exercise and are all easy to rev
 
 ### Chat commands
 
+The chat test commands are **disabled for shipping**. `/verbose` is gated by
+`Verbose.AllowSelfToggle` (default `false`) and `/velocity` by `Settings.Debug` (default
+`false`); the client-side `/speed` and `/fly` hacks have been removed entirely.
+
 | Command | Effect |
 | --- | --- |
-| `/verbose` | server-side; toggles raw per-flag output **for that player** (every flag, even below threshold) |
-| `/speed on\|off` | client-side test hack: moves at `TEST_SPEED_MULT` (1.5x) normal speed (trips Speed + Timer) |
-| `/fly on\|off` | client-side test hack: **hold Space to ascend** (Meteor Client (Minecraft) style), release to hover; moves at 1.5x normal speed (trips Flight + Speed + Timer) |
-| `/velocity <amount> <left\|right\|up\|down\|forward\|back> [fake]` | server-side: applies a real knockback of `amount` studs/s and reports it (should pass); append `fake` to report **without** applying (simulates anti-knockback so Velocity flags) |
+| `/verbose` | (off by default) toggles raw per-flag output **for that player** when `Verbose.AllowSelfToggle = true` |
+| `/velocity <amount> <left\|right\|up\|down\|forward\|back> [fake]` | (off by default) when `Debug = true`, applies/report a knockback for testing |
 
 ### Test map
 
@@ -301,9 +346,8 @@ These were added to make the anti-cheat easy to exercise and are all easy to rev
 **Through-wall** wall with pads on each side. It is a plain Folder of anchored parts; move or
 rebuild it freely.
 
-`/velocity` is handled by the Coordinator (`Player.Chatted`); `/verbose` too. `/speed` and `/fly` are handled by
-the test section in `StarterPlayerScripts.NanoAC_AlertClient` (delete that section to ship).
-The commands are hidden from chat via `TextChatService.OnIncomingMessage` (which can only be
+`/velocity` is handled by the Coordinator (`Player.Chatted`, debug-only); `/verbose` too. The
+commands are hidden from chat via `TextChatService.OnIncomingMessage` (which can only be
 **set**, never read). Movement is driven on the client — the character's network owner — so the
 server genuinely observes it; boosting `Humanoid.WalkSpeed` from the server would NOT work
 because the checks read `WalkSpeed` as their baseline.
@@ -343,8 +387,8 @@ Notes:
 - **Test-only pieces are not in the Rojo project**: `Workspace.NanoAC_TestMap` and the client
   test commands (`/speed`, `/fly`; `/velocity`/`/verbose` on the server) — delete the test
   section from `NanoAC_AlertClient` before shipping.
-- **Defaults restored**: `Setback.OnEveryFlag = false`, `Setback.Cooldown = 1.5`,
-  `Grace.AfterSetback = 1.0`, standard check streaks/cooldowns, `Alerts.EveryoneIsStaff = false`
-  (alerts go to staff only). Add your UserId to `Alerts.StaffUserIds` (or set the
-  `NanoAC_Staff` attribute) to receive alerts.
+- **Defaults**: `Setback.OnEveryFlag = true` (any flag sets the player back, subject to the
+  `Setback.Cooldown`), `Setback.Cooldown = 1.5`, `Grace.AfterSetback = 1.0`, standard check
+  streaks/cooldowns, `Alerts.EveryoneIsStaff = false` (alerts go to staff only). Add your
+  UserId to `Alerts.StaffUserIds` (or set the `NanoAC_Staff` attribute) to receive alerts.
 

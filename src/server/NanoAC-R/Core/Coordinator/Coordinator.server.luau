@@ -10,6 +10,7 @@
 	  * A violation queue that checks push into from parallel threads
 	  * Violation Levels (VL), VL decay, chat alerts and setbacks
 	  * The ExemptTeleport() whitelist API
+	  * The BanManager (strikes -> warn/kick, idle decay, whitelist, rejoin ban)
 
 	Every check lives under its own Actor so its movement maths runs in parallel. Checks
 	never touch the DataModel; they only write into the shared queue, which this script
@@ -18,12 +19,14 @@
 	Actor hierarchy (ServerScriptService):
 	  NanoAC-R (Actor)
 	    ├─ NanoShared (ModuleScript)
-	    ├─ ExemptTeleport (BindableFunction)
-	    ├─ ReportHit / ReportKnockback (BindableFunctions)
-	    ├─ Core/Coordinator (Actor) ─ Coordinator (Script)   <- this file
-	    ├─ Movement/ { Phase, Speed, Timer, Teleport, Step, Spider }
-	    ├─ Flight/   { FlightA, FlightB, FlightC, FlightD }
-	    └─ Combat/   { ThroughWall, Velocity }
+	    ├─ ExemptTeleport / ReportHit / ReportKnockback / ReportShot / ReportHeal / BanManager
+	    ├─ Core/           Coordinator (this file)
+	    ├─ Movement/       { Phase, Speed, Timer, Teleport, Step, Spider, Movement }
+	    ├─ Flight/         { FlightA, FlightB, FlightC, FlightD, Fly }
+	    ├─ Player/         { HumanoidGuard, StateGuard, IntegrityGuard, NoclipGuard,
+	    │                     PhysicsGuard, HealthGuard, HitboxGuard }
+	    ├─ Combat/         { ThroughWall, Velocity, Hit, Fling, FireRate }
+	    └─ Network/        { RemoteGuard, ToolGuard, ExploitGuard }
 	=====================================================================================
 ]]
 
@@ -40,18 +43,25 @@ local ROSTER = Shared.roster
 local QUEUE = Shared.queue
 local CONFIG = Shared.config
 
--- Combat event queues: the game reports hits / knockbacks via the ReportHit and
--- ReportKnockback bindables; the combat checks drain + validate these from parallel.
+-- Combat / sensor event queues: the game reports actions via bindables; the checks
+-- drain + validate these from parallel (except the serial network sensors).
 local HITS = SharedTableRegistry:GetSharedTable("NanoAC_Hits")
 local KNOCKS = SharedTableRegistry:GetSharedTable("NanoAC_Knockbacks")
-if HITS["write"] == nil then HITS["write"] = 0 end
-if HITS["read"] == nil then HITS["read"] = 0 end
-if KNOCKS["write"] == nil then KNOCKS["write"] = 0 end
-if KNOCKS["read"] == nil then KNOCKS["read"] = 0 end
+local HITGUARD = SharedTableRegistry:GetSharedTable("NanoAC_HitGuard")
+local SHOTS = SharedTableRegistry:GetSharedTable("NanoAC_Shots")
+local HEALS = SharedTableRegistry:GetSharedTable("NanoAC_Heals")
+local function seed(queue)
+	if queue["write"] == nil then queue["write"] = 0 end
+	if queue["read"] == nil then queue["read"] = 0 end
+end
+seed(HITS); seed(KNOCKS); seed(HITGUARD); seed(SHOTS); seed(HEALS)
 
 -- expose them to the combat checks
 CONFIG.hitsName = "NanoAC_Hits"
 CONFIG.knocksName = "NanoAC_Knockbacks"
+CONFIG.hitguardName = "NanoAC_HitGuard"
+CONFIG.shotsName = "NanoAC_Shots"
+CONFIG.healsName = "NanoAC_Heals"
 
 -- =====================================================================================
 --  SETTINGS  (everything is tunable here; the checks read a mirrored copy of this table)
@@ -60,6 +70,11 @@ local Settings = {
 	-- Master switches
 	Enabled = true,
 	Debug = false,                 -- true = verbose server console output for every flag
+
+	-- How often (seconds) the serial character scan runs for the property guards
+	-- (hitbox / physics / collision / humanoid-count). Between scans the cached values
+	-- are republished, so this is a pure CPU saving, not a detection delay for movement.
+	ScanInterval = 0.5,
 
 	-- Chat alert behaviour ------------------------------------------------------------
 	Alerts = {
@@ -77,7 +92,7 @@ local Settings = {
 
 	-- Verbose (raw per-flag chat output) ----------------------------------------------
 	Verbose = {
-		AllowSelfToggle = true,    -- any player may type /verbose to always see flags
+		AllowSelfToggle = false,   -- any player may type /verbose to always see flags (debug)
 	},
 
 	-- Grace windows (seconds) ---------------------------------------------------------
@@ -98,7 +113,7 @@ local Settings = {
 	Setback = {
 		Enabled = true,
 		Cooldown = 1.5,            -- seconds between setbacks for a single player
-		OnEveryFlag = false,       -- set back on ANY flag, not only threshold crossings
+		OnEveryFlag = true,        -- set back on ANY flag, not only threshold crossings
 		FreezeSafeSpotOnFlag = true, -- don't advance the safe spot while a player is flagged
 	},
 
@@ -106,6 +121,25 @@ local Settings = {
 	Punish = {
 		KickAfterSetbacks = 0,     -- 0 = never kick; else kick after this many setbacks
 		KickMessage = "NanoAC-R: too many movement violations.",
+	},
+
+	-- BanManager: strikes -> warn / kick, idle decay, whitelist, rejoin ban ------------
+	BanManager = {
+		Enabled = true,
+		KickEnabled = true,        -- master switch for the kick punishment
+		WarnAt = 8,                -- total strikes before the player is warned
+		KickAt = 20,               -- total strikes before the player is kicked (0 = never)
+		StrikeDecayPerSecond = 0.25, -- idle decay of the strike counter
+		WarnCooldown = 15,         -- seconds between warnings to one player
+		WhitelistIds = {           -- never flagged, never struck
+			-- 12345678,
+		},
+		WhitelistAttribute = "NanoAC_Whitelisted",
+		Persist = false,           -- true = store rejoin bans in a DataStore
+		DataStoreName = "NanoAC_Bans",
+		BanDuration = 3600,        -- seconds a rejoin ban lasts
+		KickMessage = "NanoAC-R: you have been removed by the anti-cheat.",
+		BanMessage = "NanoAC-R: you are temporarily banned from this server.",
 	},
 
 	-- Per-check tuning ----------------------------------------------------------------
@@ -188,28 +222,102 @@ local Settings = {
 			TerminalVelocity = 300,    -- downward allowance = terminal * mult * dt
 			DownMultiplier = 1.5,
 		},
+
+		-- NEW GUARDS ------------------------------------------------------------------
+		Movement = {                  -- CFrame-walk: moved with no matching velocity
+			Enabled = true, VLThreshold = 6, RequiredStreak = 3, EmitCooldown = 0.4,
+			MinMove = 3.0,             -- ignore moves shorter than this (studs)
+			VelocitySlack = 1.8,       -- allowance = |vel|*dt*this + PingAllowance
+			PingAllowance = 6,
+		},
+		Humanoid = {                  -- WalkSpeed / JumpPower / JumpHeight / HipHeight / MaxSlopeAngle
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+			WalkTolerance = 0.75,      -- absolute studs/s tolerance vs baseline
+			JumpTolerance = 2,         -- absolute jump-power tolerance
+			JumpHeightTolerance = 0.5,
+			HipTolerance = 0.35,
+			SlopeTolerance = 1.0,      -- degrees
+		},
+		State = {                     -- Flying / StrafingNoPhysics, fake sit
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+			SitGrace = 1.0,            -- seconds a Sit-with-no-seat must persist
+		},
+		Integrity = {                 -- disabled Dead/Freefall, enabled Flying, extra Humanoids
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+		},
+		Noclip = {                    -- HRP/limb collision off, NoCollisionConstraint
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+		},
+		Fly = {                       -- PlatformStand fly/hover, illegal ascent
+			Enabled = true, VLThreshold = 6, RequiredStreak = 2, EmitCooldown = 0.4,
+			MaxDescent = 8,            -- |vy| below this while platform/hovering counts as hover
+			MinAirTime = 0.6,          -- seconds before a hover/ascent flags
+			MinAscent = 8,             -- studs/s upward that is illegal without a launcher
+		},
+		Swim = {                      -- swim-in-air (own mode; separate from Fly)
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.4,
+			MinTime = 0.4,             -- seconds swimming outside water before flagging
+		},
+		Physics = {                   -- injected movers / constraints / LineForce
+			Enabled = true, VLThreshold = 4, RequiredStreak = 1, EmitCooldown = 0.5,
+			IgnoreNames = "NanoAC_Legit,NanoAC_FlyAtt,NanoAC_Fly", -- comma list or attribute
+		},
+		Health = {                    -- MaxHealth tamper, Health > MaxHealth, heal bursts
+			Enabled = true, VLThreshold = 5, RequiredStreak = 1, EmitCooldown = 0.5,
+			MaxHealthTolerance = 1,    -- absolute change of MaxHealth vs baseline
+			OverhealTolerance = 0.5,   -- Health may exceed MaxHealth by this
+			HealBurst = 25,            -- single-sample health gain above this is illegal
+			HealPerSecond = 10,        -- sustained regen credit per second
+		},
+		Hitbox = {                    -- inflated limbs / HRP / accessory handles
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+			GrowthRatio = 1.15,        -- part magnitude above baseline * this flags
+			GrowthTolerance = 0.5,     -- absolute studs of tolerance
+			AccessoryMaxSize = 4.0,    -- accessory handle magnitude above this flags
+		},
+		Fling = {                     -- extreme angular/linear velocity used to fling
+			Enabled = true, VLThreshold = 4, RequiredStreak = 2, EmitCooldown = 0.4,
+			MaxAngular = 60,           -- rad/s
+			MaxSpeed = 750,            -- studs/s
+		},
+		Hit = {                       -- reach, ping cushion, hit spam, kill aura
+			Enabled = true, VLThreshold = 5, RequiredStreak = 1, EmitCooldown = 0.4,
+			Reach = 9.0,               -- studs of allowed reach
+			PingAllowance = 3.0,       -- extra studs of reach per second of ping
+			MaxHitsPerSecond = 20,
+			AuraTargets = 4,           -- distinct victims within AuraWindow = kill aura
+			AuraWindow = 0.6,
+		},
+		FireRate = {                  -- shot rate limits
+			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
+			MaxShotsPerSecond = 12,
+			Window = 1.0,
+			Grace = 0.15,              -- ignore the very first shots in a burst window
+		},
+		Remote = {                    -- global + per-remote spam + oversized payloads
+			Enabled = true, VLThreshold = 6, RequiredStreak = 1, EmitCooldown = 0.5,
+			MaxPerSecond = 60,         -- per player, across all remotes
+			MaxPerRemotePerSecond = 30,
+			MaxPayload = 8000,         -- characters of string payload per call
+			MaxArgs = 12,
+		},
+		Tool = {                      -- tool equip / activate spam
+			Enabled = true, VLThreshold = 5, RequiredStreak = 1, EmitCooldown = 0.5,
+			MaxEquipsPerSecond = 6,
+			MaxActivatesPerSecond = 14,
+			Window = 1.0,
+		},
+		Exploit = {                   -- suspicious remote names
+			Enabled = true, VLThreshold = 3, RequiredStreak = 1, EmitCooldown = 2.0,
+			Patterns = "getgenv,getrawmetatable,httpget,loadstring,backdoor,exploit,hack,killaura,aimbot,godmode,virus,redeem,unlimited,admin,kick,ban,ss,__",
+		},
 	},
 }
 
 -- =====================================================================================
 --  PUBLISH CONFIG  (mirror the numeric/bool settings into a SharedTable for the checks)
 -- =====================================================================================
-local function publishConfig()
-	CONFIG.paused = not Settings.Enabled
-	CONFIG.debug = Settings.Debug
-	CONFIG.gravity = Workspace.Gravity
-
-	CONFIG.graceSpawn = Settings.Grace.AfterSpawn
-	CONFIG.graceTeleport = Settings.Grace.AfterTeleport
-	CONFIG.graceSetback = Settings.Grace.AfterSetback
-	CONFIG.graceSeat = Settings.Grace.AfterSeat
-
-	CONFIG.vlDecay = Settings.VL.DecayPerSecond
-	CONFIG.vlMax = Settings.VL.MaxDisplay
-	CONFIG.setbackEnabled = Settings.Setback.Enabled
-	CONFIG.setbackCooldown = Settings.Setback.Cooldown
-	CONFIG.kickAfterSetbacks = Settings.Punish.KickAfterSetbacks
-
+local function publishLegacy()
 	local p = Settings.Checks.Phase
 	CONFIG.phaseEnabled = p.Enabled
 	CONFIG.phaseVlThreshold = p.VLThreshold
@@ -325,6 +433,68 @@ local function publishConfig()
 	CONFIG.teleportDownMultiplier = tp.DownMultiplier
 end
 
+-- New checks use a table-driven publisher: every scalar field becomes
+-- "<prefix><Field>" (e.g. Humanoid.Enabled -> humanoidEnabled).
+local PUBLISH = {
+	{ name = "Movement",  prefix = "movement",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinMove", "VelocitySlack", "PingAllowance" } },
+	{ name = "Humanoid",  prefix = "humanoid",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "WalkTolerance", "JumpTolerance", "JumpHeightTolerance", "HipTolerance", "SlopeTolerance" } },
+	{ name = "State",     prefix = "state",     fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "SitGrace" } },
+	{ name = "Integrity", prefix = "integrity", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+	{ name = "Noclip",    prefix = "noclip",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+	{ name = "Fly",       prefix = "fly",       fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxDescent", "MinAirTime", "MinAscent" } },
+	{ name = "Swim",      prefix = "swim",      fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinTime" } },
+	{ name = "Physics",   prefix = "physics",   fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+	{ name = "Health",    prefix = "health",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxHealthTolerance", "OverhealTolerance", "HealBurst", "HealPerSecond" } },
+	{ name = "Hitbox",    prefix = "hitbox",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "GrowthRatio", "GrowthTolerance", "AccessoryMaxSize" } },
+	{ name = "Fling",     prefix = "fling",     fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxAngular", "MaxSpeed" } },
+	{ name = "Hit",       prefix = "hit",       fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "Reach", "PingAllowance", "MaxHitsPerSecond", "AuraTargets", "AuraWindow" } },
+	{ name = "FireRate",  prefix = "fireRate",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxShotsPerSecond", "Window", "Grace" } },
+	{ name = "Remote",    prefix = "remote",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxPerSecond", "MaxPerRemotePerSecond", "MaxPayload", "MaxArgs" } },
+	{ name = "Tool",      prefix = "tool",      fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxEquipsPerSecond", "MaxActivatesPerSecond", "Window" } },
+	{ name = "Exploit",   prefix = "exploit",   fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+}
+
+local function publishConfig()
+	CONFIG.paused = not Settings.Enabled
+	CONFIG.debug = Settings.Debug
+	CONFIG.gravity = Workspace.Gravity
+	CONFIG.scanInterval = Settings.ScanInterval
+
+	CONFIG.graceSpawn = Settings.Grace.AfterSpawn
+	CONFIG.graceTeleport = Settings.Grace.AfterTeleport
+	CONFIG.graceSetback = Settings.Grace.AfterSetback
+	CONFIG.graceSeat = Settings.Grace.AfterSeat
+
+	CONFIG.vlDecay = Settings.VL.DecayPerSecond
+	CONFIG.vlMax = Settings.VL.MaxDisplay
+	CONFIG.setbackEnabled = Settings.Setback.Enabled
+	CONFIG.setbackCooldown = Settings.Setback.Cooldown
+	CONFIG.kickAfterSetbacks = Settings.Punish.KickAfterSetbacks
+
+	publishLegacy()
+
+	for _, spec in ipairs(PUBLISH) do
+		local c = Settings.Checks[spec.name]
+		if c ~= nil then
+			for _, f in ipairs(spec.fields) do
+				CONFIG[spec.prefix .. f] = c[f]
+			end
+		end
+	end
+
+	-- String / list configs
+	CONFIG.physicsIgnoreNames = Settings.Checks.Physics.IgnoreNames
+	CONFIG.exploitPatterns = Settings.Checks.Exploit.Patterns
+
+	-- BanManager
+	local bm = Settings.BanManager
+	CONFIG.banEnabled = bm.Enabled
+	CONFIG.banKickEnabled = bm.KickEnabled
+	CONFIG.banWarnAt = bm.WarnAt
+	CONFIG.banKickAt = bm.KickAt
+	CONFIG.banDecay = bm.StrikeDecayPerSecond
+end
+
 publishConfig()
 
 -- =====================================================================================
@@ -343,6 +513,14 @@ end
 local records = {}        -- [userId] = record
 local verbosePlayers = {} -- [userId] = true (raw flag output)
 local setupCommands       -- forward declaration
+local isWhitelisted       -- forward declaration
+local notify              -- forward declaration
+local Bans                -- forward declaration
+
+local DEFAULT_BASELINE = {
+	walk = 16, jump = 50, jumpHeight = 7.2, hip = 2, slope = 89,
+	health = 100, maxHealth = 100, hitbox = 0, accessory = 0,
+}
 
 local function newRecord(plr)
 	local stateTable = SharedTable.new({
@@ -354,6 +532,8 @@ local function newRecord(plr)
 		ping = 0,
 		walkSpeed = 16,
 		jumpPower = 50,
+		jumpHeight = 7.2,
+		maxSlopeAngle = 89,
 		hipHeight = 2,
 		grounded = false,
 		stateName = "",
@@ -376,6 +556,41 @@ local function newRecord(plr)
 		lastValidYaw = 0,
 		lastValidTime = 0,
 		setbackCount = 0,
+		-- extended state (new guards)
+		health = 100,
+		maxHealth = 100,
+		walkBase = 16,
+		jumpBase = 50,
+		jumpHeightBase = 7.2,
+		hipBase = 2,
+		slopeBase = 89,
+		healthBase = 100,
+		maxHealthBase = 100,
+		hitbox = 0,
+		hitboxBase = 0,
+		accessory = 0,
+		accessoryBase = 0,
+		hrpCanCollide = true,
+		limbNoCollide = 0,
+		noCollision = 0,
+		platformStand = false,
+		flying = false,
+		flyingEnabled = true,
+		flyingEnabledBase = true,
+		deadDisabled = false,
+		deadDisabledBase = false,
+		freefallDisabled = false,
+		freefallDisabledBase = false,
+		strafingNoPhysics = false,
+		sitNoSeat = false,
+		swimInAir = false,
+		humanoidCount = 1,
+		physCount = 0,
+		vel = Vector3.zero,
+		angVel = Vector3.zero,
+		angSpeed = 0,
+		whitelisted = false,
+		strikes = 0,
 	})
 	return {
 		player = plr,
@@ -390,8 +605,13 @@ local function newRecord(plr)
 		exemptUntil = 0,
 		setbacks = 0,
 		setbackCooldownUntil = 0,
-		vl = {},
+		strikes = 0,
 		lastDecay = now(),
+		lastWarn = 0,
+		lastScan = 0,
+		baseSet = false,
+		baseline = {},
+		vl = {},
 	}
 end
 
@@ -406,6 +626,9 @@ local function onCharacterAdded(plr)
 	rec.exemptUntil = t + Settings.Grace.AfterTeleport
 	rec.setbackCooldownUntil = t + Settings.Grace.AfterSetback
 	rec.lastSampleTime = nil
+	rec.baseSet = false
+	rec.baseline = {}
+	rec.lastScan = 0
 	local st = rec.stateTable
 	st.graceUntil = rec.graceUntil
 	st.exemptUntil = rec.exemptUntil
@@ -415,6 +638,17 @@ end
 
 local function onPlayerAdded(plr)
 	if records[plr.UserId] ~= nil then return end
+
+	-- BanManager: refuse a still-active rejoin ban.
+	if Settings.BanManager.Enabled then
+		local banned, until_ = Bans.isBanned(plr, function(expiry)
+			plr:Kick(Settings.BanManager.BanMessage)
+		end)
+		if banned then
+			return
+		end
+	end
+
 	local rec = newRecord(plr)
 	rec.graceUntil = now() + Settings.Grace.AfterSpawn
 	rec.exemptUntil = now() + Settings.Grace.AfterTeleport
@@ -450,10 +684,199 @@ local function onPlayerRemoving(plr)
 	ROSTER[plr.UserId] = nil
 end
 
-Players.PlayerAdded:Connect(onPlayerAdded)
-Players.PlayerRemoving:Connect(onPlayerRemoving)
-for _, plr in ipairs(Players:GetPlayers()) do
-	onPlayerAdded(plr)
+-- =====================================================================================
+--  BAN MANAGER  (strikes -> warn / kick, idle decay, whitelist, rejoin ban)
+-- =====================================================================================
+local DataStoreService
+local banStore
+if Settings.BanManager.Persist then
+	local ok, dss = pcall(function() return game:GetService("DataStoreService") end)
+	if ok then
+		DataStoreService = dss
+		local ok2, store = pcall(function()
+			return DataStoreService:GetDataStore(Settings.BanManager.DataStoreName)
+		end)
+		if ok2 then banStore = store end
+	end
+end
+
+local sessionBans = {}   -- [userId] = expiry (server time seconds)
+Bans = {}
+function Bans.isBanned(plr, kickFn)
+	local userId = plr.UserId
+	local expiry = sessionBans[userId]
+	if expiry == nil and banStore ~= nil then
+		local ok, val = pcall(function() return banStore:GetAsync("ban_" .. userId) end)
+		if ok and type(val) == "number" then
+			expiry = val
+			sessionBans[userId] = val
+		end
+	end
+	if expiry == nil then return false, 0 end
+	if now() >= expiry then
+		sessionBans[userId] = nil
+		if banStore ~= nil then
+			pcall(function() banStore:RemoveAsync("ban_" .. userId) end)
+		end
+		return false, 0
+	end
+	if kickFn then
+		task.defer(kickFn, expiry)
+	end
+	return true, expiry
+end
+
+function Bans.ban(plr, reason)
+	local expiry = now() + Settings.BanManager.BanDuration
+	sessionBans[plr.UserId] = expiry
+	if banStore ~= nil then
+		pcall(function() banStore:SetAsync("ban_" .. plr.UserId, expiry) end)
+	end
+	if Settings.Debug then
+		warn(string.format("[NanoAC-R] banned %s (%s) until %d", plr.Name, tostring(reason), expiry))
+	end
+end
+
+function Bans.strike(rec, reason, count)
+	local amount = tonumber(count) or 1
+	rec.strikes += amount
+	rec.stateTable.strikes = rec.strikes
+	local bm = Settings.BanManager
+	if not bm.Enabled then return end
+	if bm.KickEnabled and bm.KickAt > 0 and rec.strikes >= bm.KickAt then
+		Bans.ban(rec.player, reason)
+		if not isWhitelisted(rec.player) then
+			rec.player:Kick(bm.KickMessage)
+		end
+		return
+	end
+	local t = now()
+	if bm.WarnAt > 0 and rec.strikes >= bm.WarnAt and (t - rec.lastWarn) >= bm.WarnCooldown then
+		rec.lastWarn = t
+		notify(rec.player, string.format("[NanoAC-R] warning: strikes %d/%d (%s)", rec.strikes, bm.WarnAt, tostring(reason)))
+	end
+end
+
+-- =====================================================================================
+--  BINDABLES
+-- =====================================================================================
+local function ensureBindable(name)
+	local b = rootActor:FindFirstChild(name)
+	if b == nil then
+		b = Instance.new("BindableFunction")
+		b.Name = name
+		b.Parent = rootActor
+	end
+	return b
+end
+
+-- ExemptTeleport API: other server scripts whitelist a legitimate teleport.
+local exemptBindable = ensureBindable("ExemptTeleport")
+exemptBindable.OnInvoke = function(plr, duration)
+	if typeof(plr) ~= "Instance" or not plr:IsA("Player") then
+		return false
+	end
+	local rec = records[plr.UserId]
+	if rec == nil then
+		return false
+	end
+	local seconds = tonumber(duration) or Settings.Grace.AfterTeleport
+	rec.exemptUntil = now() + seconds
+	rec.stateTable.exemptUntil = rec.exemptUntil
+	return true
+end
+
+-- Combat reporting API --------------------------------------------------------------
+local reportHit = ensureBindable("ReportHit")
+reportHit.OnInvoke = function(attacker, victim)
+	if typeof(attacker) ~= "Instance" or not attacker:IsA("Player") then return false end
+	if typeof(victim) ~= "Instance" or not victim:IsA("Player") then return false end
+	local at = attacker.Character and attacker.Character:FindFirstChild("HumanoidRootPart")
+	local vt = victim.Character and victim.Character:FindFirstChild("HumanoidRootPart")
+	if at == nil or vt == nil then return false end
+	local payload = {
+		attacker = attacker.UserId,
+		victim = victim.UserId,
+		ax = at.Position.X, ay = at.Position.Y, az = at.Position.Z,
+		vx = vt.Position.X, vy = vt.Position.Y, vz = vt.Position.Z,
+		t = now(),
+	}
+	local i = SharedTable.increment(HITS, "write", 1) + 1
+	HITS[i] = SharedTable.new(payload)
+	local j = SharedTable.increment(HITGUARD, "write", 1) + 1
+	HITGUARD[j] = SharedTable.new(payload)
+	return true
+end
+
+local reportKnock = ensureBindable("ReportKnockback")
+reportKnock.OnInvoke = function(victim, velocity)
+	if typeof(victim) ~= "Instance" or not victim:IsA("Player") then return false end
+	if typeof(velocity) ~= "Vector3" then return false end
+	local root = victim.Character and victim.Character:FindFirstChild("HumanoidRootPart")
+	local px, py, pz = 0, 0, 0
+	if root ~= nil then
+		px, py, pz = root.Position.X, root.Position.Y, root.Position.Z
+	end
+	local i = SharedTable.increment(KNOCKS, "write", 1) + 1
+	KNOCKS[i] = SharedTable.new({
+		victim = victim.UserId,
+		vx = velocity.X, vy = velocity.Y, vz = velocity.Z,
+		px = px, py = py, pz = pz,
+		t = now(),
+	})
+	return true
+end
+
+-- FireRate API: game reports each shot it resolves.
+local reportShot = ensureBindable("ReportShot")
+reportShot.OnInvoke = function(plr, weapon)
+	if typeof(plr) ~= "Instance" or not plr:IsA("Player") then return false end
+	local i = SharedTable.increment(SHOTS, "write", 1) + 1
+	SHOTS[i] = SharedTable.new({
+		userId = plr.UserId,
+		weapon = typeof(weapon) == "string" and weapon or "",
+		t = now(),
+	})
+	return true
+end
+
+-- Health API: game reports a legitimate heal so HealthGuard can credit it.
+local reportHeal = ensureBindable("ReportHeal")
+reportHeal.OnInvoke = function(plr, amount)
+	if typeof(plr) ~= "Instance" or not plr:IsA("Player") then return false end
+	local amt = tonumber(amount) or 0
+	local i = SharedTable.increment(HEALS, "write", 1) + 1
+	HEALS[i] = SharedTable.new({ userId = plr.UserId, amount = amt, t = now() })
+	return true
+end
+
+-- BanManager API: BanManager:Invoke(action, playerOrUserId, arg)
+local banBindable = ensureBindable("BanManager")
+banBindable.OnInvoke = function(action, subject, arg)
+	if action == "strike" then
+		local rec = typeof(subject) == "Instance" and records[subject.UserId]
+		if rec then Bans.strike(rec, arg or "manual", 1); return true end
+	elseif action == "whitelist" then
+		if typeof(subject) == "Instance" then
+			subject:SetAttribute(Settings.BanManager.WhitelistAttribute, true)
+			local rec = records[subject.UserId]
+			if rec then rec.stateTable.whitelisted = true end
+			return true
+		end
+	elseif action == "unban" then
+		local uid = typeof(subject) == "Instance" and subject.UserId or tonumber(subject)
+		if uid then
+			sessionBans[uid] = nil
+			if banStore ~= nil then pcall(function() banStore:RemoveAsync("ban_" .. uid) end) end
+			return true
+		end
+	elseif action == "isWhitelisted" then
+		if typeof(subject) == "Instance" then return isWhitelisted(subject) end
+	elseif action == "isBanned" then
+		local uid = typeof(subject) == "Instance" and subject.UserId or tonumber(subject)
+		if uid then return sessionBans[uid] ~= nil end
+	end
+	return false
 end
 
 -- =====================================================================================
@@ -466,9 +889,10 @@ if alertEvent == nil then
 	alertEvent.Parent = ReplicatedStorage
 end
 
-local function notify(plr, text, color)
+local function topLevelNotify(plr, text, color)
 	alertEvent:FireClient(plr, text, color or Settings.Alerts.Color)
 end
+notify = topLevelNotify
 
 -- ---------------------------------------------------------------------------------
 --  CHAT COMMANDS  --  /verbose toggles raw per-flag output for the typing player
@@ -491,10 +915,8 @@ setupCommands = function(plr)
 			if Settings.Debug then
 				print(string.format("[NanoAC-R] %s verbose=%s", plr.Name, tostring(on)))
 			end
-		elseif cmd == "velocity" then
-			-- test command:  /velocity <amount> <left|right|up|down|forward|back> [fake]
-			-- applies a knockback in that direction and reports it (add "fake" to report
-			-- WITHOUT applying it, i.e. simulate anti-knockback so the check can flag).
+		elseif cmd == "velocity" and Settings.Debug then
+			-- test command (debug only):  /velocity <amount> <left|right|up|down|forward|back> [fake]
 			local amount = tonumber(a1)
 			local dirName = (a2 or ""):lower()
 			local fake = (a3 or ""):lower() == "fake"
@@ -502,54 +924,52 @@ setupCommands = function(plr)
 				notify(plr, "[NanoAC-R] usage: /velocity <amount> <left|right|up|down>", Settings.Alerts.Color)
 				return
 			end
-			if amount ~= nil and amount > 0 then
-				amount = math.min(amount, 1000)
-				local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-				if root ~= nil then
-					local cf = root.CFrame
-					local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
-					if right.Magnitude < 1e-3 then right = Vector3.new(1, 0, 0) end
-					right = right.Unit
-					local forward = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
-					if forward.Magnitude < 1e-3 then forward = Vector3.new(0, 0, -1) end
-					forward = forward.Unit
-					local dir
-					if dirName == "left" then dir = -right
-					elseif dirName == "right" then dir = right
-					elseif dirName == "up" then dir = Vector3.new(0, 1, 0)
-					elseif dirName == "down" then dir = Vector3.new(0, -1, 0)
-					elseif dirName == "forward" then dir = forward
-					elseif dirName == "back" then dir = -forward
+			amount = math.min(amount, 1000)
+			local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if root ~= nil then
+				local cf = root.CFrame
+				local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+				if right.Magnitude < 1e-3 then right = Vector3.new(1, 0, 0) end
+				right = right.Unit
+				local forward = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+				if forward.Magnitude < 1e-3 then forward = Vector3.new(0, 0, -1) end
+				forward = forward.Unit
+				local dir
+				if dirName == "left" then dir = -right
+				elseif dirName == "right" then dir = right
+				elseif dirName == "up" then dir = Vector3.new(0, 1, 0)
+				elseif dirName == "down" then dir = Vector3.new(0, -1, 0)
+				elseif dirName == "forward" then dir = forward
+				elseif dirName == "back" then dir = -forward
+				end
+				if dir == nil then
+					notify(plr, "[NanoAC-R] unknown direction (left/right/up/down/forward/back)", Settings.Alerts.Color)
+				else
+					local vec = dir * amount
+					notify(plr, string.format("[NanoAC-R] velocity %d %s%s", amount, dirName, fake and " (fake)" or ""), Settings.Alerts.Color)
+					if not fake then
+						local att = Instance.new("Attachment")
+						att.Name = "NanoAC_Legit"
+						att.Parent = root
+						local lv = Instance.new("LinearVelocity")
+						lv.Name = "NanoAC_Legit"
+						lv.Attachment0 = att
+						lv.RelativeTo = Enum.ActuatorRelativeTo.World
+						lv.MaxForce = 1e6
+						lv.VectorVelocity = vec
+						lv.Parent = root
+						task.delay(0.15, function()
+							pcall(function() lv:Destroy() end)
+							pcall(function() att:Destroy() end)
+						end)
 					end
-					if dir == nil then
-						notify(plr, "[NanoAC-R] unknown direction (left/right/up/down/forward/back)", Settings.Alerts.Color)
-					else
-						local vec = dir * amount
-						notify(plr, string.format("[NanoAC-R] velocity %d %s%s", amount, dirName, fake and " (fake)" or ""), Settings.Alerts.Color)
-						if not fake then
-							-- apply a real, short impulse via a mover (a plain velocity write is
-							-- fought by the Humanoid controller, so it would under-report).
-							local att = Instance.new("Attachment")
-							att.Parent = root
-							local lv = Instance.new("LinearVelocity")
-							lv.Attachment0 = att
-							lv.RelativeTo = Enum.ActuatorRelativeTo.World
-							lv.MaxForce = 1e6
-							lv.VectorVelocity = vec
-							lv.Parent = root
-							task.delay(0.15, function()
-								pcall(function() lv:Destroy() end)
-								pcall(function() att:Destroy() end)
-							end)
-						end
-						local i = SharedTable.increment(KNOCKS, "write", 1) + 1
-						KNOCKS[i] = SharedTable.new({
-							victim = plr.UserId,
-							vx = vec.X, vy = vec.Y, vz = vec.Z,
-							px = root.Position.X, py = root.Position.Y, pz = root.Position.Z,
-							t = now(),
-						})
-					end
+					local i = SharedTable.increment(KNOCKS, "write", 1) + 1
+					KNOCKS[i] = SharedTable.new({
+						victim = plr.UserId,
+						vx = vec.X, vy = vec.Y, vz = vec.Z,
+						px = root.Position.X, py = root.Position.Y, pz = root.Position.Z,
+						t = now(),
+					})
 				end
 			end
 		end
@@ -560,6 +980,7 @@ for _, plr in ipairs(Players:GetPlayers()) do
 	setupCommands(plr)
 end
 
+-- Staff / whitelist ---------------------------------------------------------------
 local function isStaff(plr)
 	if Settings.Alerts.EveryoneIsStaff then
 		return true
@@ -581,6 +1002,13 @@ local function isStaff(plr)
 	return false
 end
 
+isWhitelisted = function(plr)
+	if plr == nil then return false end
+	if table.find(Settings.BanManager.WhitelistIds, plr.UserId) then return true end
+	if plr:GetAttribute(Settings.BanManager.WhitelistAttribute) == true then return true end
+	return false
+end
+
 local function sendAlert(text)
 	if not Settings.Alerts.Enabled then return end
 	local color = Settings.Alerts.Color
@@ -592,85 +1020,6 @@ local function sendAlert(text)
 	if Settings.Debug then
 		warn("[NanoAC-R] " .. text)
 	end
-end
-
--- =====================================================================================
---  EXEMPT TELEPORT API
---   Other server scripts can whitelist a legitimate teleport with:
---     game.ServerScriptService["NanoAC-R"].ExemptTeleport:Invoke(player, optionalSeconds)
--- =====================================================================================
-local exemptBindable = rootActor:FindFirstChild("ExemptTeleport")
-if exemptBindable == nil then
-	exemptBindable = Instance.new("BindableFunction")
-	exemptBindable.Name = "ExemptTeleport"
-	exemptBindable.Parent = rootActor
-end
-
-exemptBindable.OnInvoke = function(plr, duration)
-	if typeof(plr) ~= "Instance" or not plr:IsA("Player") then
-		return false
-	end
-	local rec = records[plr.UserId]
-	if rec == nil then
-		return false
-	end
-	local seconds = tonumber(duration) or Settings.Grace.AfterTeleport
-	rec.exemptUntil = now() + seconds
-	rec.stateTable.exemptUntil = rec.exemptUntil
-	return true
-end
-
--- =====================================================================================
---  COMBAT REPORTING API
---   Game code reports resolved hits + applied knockback here; the Combat checks validate.
---     game.ServerScriptService["NanoAC-R"].ReportHit:Invoke(attacker, victim)
---     game.ServerScriptService["NanoAC-R"].ReportKnockback:Invoke(victim, knockbackVelocity)
--- =====================================================================================
-local function ensureBindable(name)
-	local b = rootActor:FindFirstChild(name)
-	if b == nil then
-		b = Instance.new("BindableFunction")
-		b.Name = name
-		b.Parent = rootActor
-	end
-	return b
-end
-
-local reportHit = ensureBindable("ReportHit")
-reportHit.OnInvoke = function(attacker, victim)
-	if typeof(attacker) ~= "Instance" or not attacker:IsA("Player") then return false end
-	if typeof(victim) ~= "Instance" or not victim:IsA("Player") then return false end
-	local at = attacker.Character and attacker.Character:FindFirstChild("HumanoidRootPart")
-	local vt = victim.Character and victim.Character:FindFirstChild("HumanoidRootPart")
-	if at == nil or vt == nil then return false end
-	local i = SharedTable.increment(HITS, "write", 1) + 1
-	HITS[i] = SharedTable.new({
-		attacker = attacker.UserId,
-		victim = victim.UserId,
-		ax = at.Position.X, ay = at.Position.Y, az = at.Position.Z,
-		vx = vt.Position.X, vy = vt.Position.Y, vz = vt.Position.Z,
-		t = now(),
-	})
-	return true
-end
-
-local reportKnock = ensureBindable("ReportKnockback")
-reportKnock.OnInvoke = function(victim, velocity)
-	if typeof(victim) ~= "Instance" or not victim:IsA("Player") then return false end
-	if typeof(velocity) ~= "Vector3" then return false end
-	local root = victim.Character and victim.Character:FindFirstChild("HumanoidRootPart")
-	local px, py, pz = 0, 0, 0
-	if root ~= nil then
-		px, py, pz = root.Position.X, root.Position.Y, root.Position.Z
-	end
-	local i = SharedTable.increment(KNOCKS, "write", 1) + 1
-	KNOCKS[i] = SharedTable.new({
-		victim = victim.UserId,
-		vx = velocity.X, vy = velocity.Y, vz = velocity.Z,
-		px = px, py = py, pz = pz,
-		t = now(),
-	})
-	return true
 end
 
 -- =====================================================================================
@@ -719,6 +1068,7 @@ local function handleViolation(vrec, t)
 	local rec = records[vrec.userId]
 	if rec == nil then return end
 	if not Settings.Enabled then return end
+	if isWhitelisted(rec.player) then return end
 	if t < rec.graceUntil or t < rec.exemptUntil then return end
 
 	local check = vrec.check
@@ -736,7 +1086,6 @@ local function handleViolation(vrec, t)
 	-- remember we flagged this player so the safe spot stops advancing (see sample())
 	rec.lastFlagTime = t
 
-	-- always-show-flags mode (/verbose): emit every raw flag to the typing player
 	if verbosePlayers[vrec.userId] == true then
 		alertEvent:FireClient(rec.player, string.format("[NanoAC-R] %s failed %s VL:%.1f mag:%.2f %s",
 			rec.name, check, cur, vrec.magnitude or 0, vrec.detail or ""), Settings.Alerts.Color)
@@ -745,8 +1094,8 @@ local function handleViolation(vrec, t)
 	if t >= rec.setbackCooldownUntil then
 		local crossedThreshold = cur >= thresholdFor(check)
 		if crossedThreshold then
-			-- Exact required alert format: "<username> failed <Check> VL:<times> Times"
 			sendAlert(string.format("%s failed %s VL:%d Times", rec.name, check, math.floor(math.min(cur, Settings.VL.MaxDisplay))))
+			Bans.strike(rec, check, 1)
 		end
 		if Settings.Setback.Enabled and (Settings.Setback.OnEveryFlag or crossedThreshold) then
 			setback(rec)
@@ -792,6 +1141,75 @@ local function overlapsSolid(pos, char)
 	return false
 end
 
+-- Physics item classes that are never part of a legitimately-joined character. The modern
+-- R15 rig uses BallSocketConstraint / AnimationConstraint / RigidConstraint for its joints
+-- and NoCollisionConstraint for accessory non-collision, so those are deliberately EXCLUDED.
+local PHYS_CLASSES = {
+	BodyVelocity = true, BodyAngularVelocity = true, BodyForce = true, BodyThrust = true,
+	BodyPosition = true, BodyGyro = true, RocketPropulsion = true,
+	LinearVelocity = true, AngularVelocity = true, VectorForce = true,
+	AlignOrientation = true, AlignPosition = true, Torque = true, LineForce = true,
+	CylindricalConstraint = true, HingeConstraint = true, PrismaticConstraint = true,
+	RopeConstraint = true, RodConstraint = true, SpringConstraint = true,
+	UniversalConstraint = true, PlaneConstraint = true,
+}
+
+local function scanCharacter(rec, char, hum)
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local limbNoCollide, hitbox, accessory = 0, 0, 0
+	if hum ~= nil then
+		for _, part in ipairs(char:GetChildren()) do
+			if part:IsA("BasePart") then
+				local limb = hum:GetLimb(part)
+				-- HumanoidRootPart is not a "limb" to GetLimb, so include it explicitly.
+				if limb ~= Enum.Limb.Unknown or part == hrp then
+					local mag = part.Size.Magnitude
+					if mag > hitbox then hitbox = mag end
+					if part.CanCollide == false and part ~= hrp then limbNoCollide += 1 end
+				end
+			elseif part:IsA("Accessory") then
+				local handle = part:FindFirstChild("Handle")
+				if handle and handle:IsA("BasePart") then
+					local mag = handle.Size.Magnitude
+					if mag > accessory then accessory = mag end
+				end
+			end
+		end
+	end
+
+	local noCollision, physCount, humanoidCount = 0, 0, 0
+	local ignore = Settings.Checks.Physics.IgnoreNames
+	local function ignored(inst)
+		if inst:GetAttribute("NanoAC_Legit") == true then return true end
+		if ignore ~= "" and string.find(ignore, inst.Name, 1, true) then return true end
+		return false
+	end
+	for _, inst in ipairs(char:GetDescendants()) do
+		local cls = inst.ClassName
+		if inst:IsA("Humanoid") then
+			humanoidCount += 1
+		elseif cls == "NoCollisionConstraint" then
+			-- The rig creates these for accessories on the limbs; an injected noclip
+			-- constraint targets the HumanoidRootPart, so only count those.
+			if inst.Parent == hrp then
+				noCollision += 1
+			end
+		elseif PHYS_CLASSES[cls] == true then
+			if not ignored(inst) then
+				physCount += 1
+			end
+		end
+	end
+
+	rec.stateTable.hrpCanCollide = (hrp == nil) or hrp.CanCollide
+	rec.stateTable.limbNoCollide = limbNoCollide
+	rec.stateTable.noCollision = noCollision
+	rec.stateTable.hitbox = hitbox
+	rec.stateTable.accessory = accessory
+	rec.stateTable.physCount = physCount
+	rec.stateTable.humanoidCount = humanoidCount
+end
+
 local function sample(rec, t)
 	local plr = rec.player
 	local st = rec.stateTable
@@ -835,14 +1253,50 @@ local function sample(rec, t)
 	local freefall = hstate == Enum.HumanoidStateType.Freefall
 	local jumping = hstate == Enum.HumanoidStateType.Jumping
 
+	-- Capture the spawn baseline once per character (used by the property guards).
+	if not rec.baseSet then
+		rec.baseSet = true
+		rec.baseline = {
+			walk = hum.WalkSpeed,
+			jump = hum.JumpPower,
+			jumpHeight = hum.JumpHeight,
+			hip = hum.HipHeight,
+			slope = hum.MaxSlopeAngle,
+			health = hum.Health,
+			maxHealth = hum.MaxHealth,
+		}
+		st.walkBase = rec.baseline.walk
+		st.jumpBase = rec.baseline.jump
+		st.jumpHeightBase = rec.baseline.jumpHeight
+		st.hipBase = rec.baseline.hip
+		st.slopeBase = rec.baseline.slope
+		st.healthBase = rec.baseline.health
+		st.maxHealthBase = rec.baseline.maxHealth
+		st.flyingEnabledBase = hum:GetStateEnabled(Enum.HumanoidStateType.Flying)
+		st.deadDisabledBase = not hum:GetStateEnabled(Enum.HumanoidStateType.Dead)
+		st.freefallDisabledBase = not hum:GetStateEnabled(Enum.HumanoidStateType.Freefall)
+		scanCharacter(rec, char, hum)
+		st.hitboxBase = st.hitbox
+		st.accessoryBase = st.accessory
+		rec.lastScan = t
+	end
+
+	-- Throttled expensive character scan.
+	local scanInterval = Settings.ScanInterval
+	if (t - rec.lastScan) >= scanInterval then
+		rec.lastScan = t
+		local okScan, errScan = pcall(scanCharacter, rec, char, hum)
+		if not okScan and Settings.Debug then
+			warn("[NanoAC-R] scan error for " .. tostring(rec.name) .. ": " .. tostring(errScan))
+		end
+	end
+
 	-- Remember the most recent safe, supported spot for setbacks.
 	local supported = grounded or seated or swim or climb or platform
 	local inGrace = t < rec.graceUntil
 	local exempt = t < rec.exemptUntil
 	local moved = rec.prevSamplePos ~= nil and (pos - rec.prevSamplePos).Magnitude or 1
 	rec.prevSamplePos = pos
-	-- Advance the safe spot only on open, supported ground (never while intersecting a solid),
-	-- so a player phasing through a wall keeps their last valid position behind the wall.
 	local recentlyFlagged = Settings.Setback.FreezeSafeSpotOnFlag and rec.lastFlagTime ~= nil and (t - rec.lastFlagTime) <= 0.75
 	if supported and not inGrace and not exempt and moved > 0.25 and not recentlyFlagged then
 		if not overlapsSolid(pos, char) then
@@ -852,12 +1306,17 @@ local function sample(rec, t)
 		end
 	end
 
+	local vel = root.AssemblyLinearVelocity
+	local angVel = root.AssemblyAngularVelocity
+
 	st.pos = pos
 	st.time = t
 	st.dt = dt
 	st.ping = plr:GetNetworkPing()
 	st.walkSpeed = hum.WalkSpeed
 	st.jumpPower = hum.JumpPower
+	st.jumpHeight = hum.JumpHeight
+	st.maxSlopeAngle = hum.MaxSlopeAngle
 	st.hipHeight = hum.HipHeight
 	st.grounded = grounded
 	st.vy = vy
@@ -881,6 +1340,23 @@ local function sample(rec, t)
 	st.lastValidYaw = rec.lastValidYaw
 	st.lastValidTime = rec.lastValidTime
 	st.setbackCount = rec.setbacks
+
+	-- Extended state -------------------------------------------------------------
+	st.health = hum.Health
+	st.maxHealth = hum.MaxHealth
+	st.vel = vel
+	st.angVel = angVel
+	st.angSpeed = angVel.Magnitude
+	st.platformStand = hum.PlatformStand
+	st.flying = hstate == Enum.HumanoidStateType.Flying
+	st.flyingEnabled = hum:GetStateEnabled(Enum.HumanoidStateType.Flying)
+	st.deadDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Dead)
+	st.freefallDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Freefall)
+	st.strafingNoPhysics = hstate == Enum.HumanoidStateType.StrafingNoPhysics
+	st.sitNoSeat = (hum.Sit == true) and (hum.SeatPart == nil)
+	st.swimInAir = (hstate == Enum.HumanoidStateType.Swimming) and (hum.FloorMaterial ~= Enum.Material.Water)
+	st.whitelisted = isWhitelisted(plr)
+	st.strikes = rec.strikes
 end
 
 RunService.PostSimulation:Connect(function()
@@ -892,13 +1368,17 @@ RunService.PostSimulation:Connect(function()
 			warn("[NanoAC-R] sample error for " .. tostring(rec.name) .. ": " .. tostring(err))
 		end
 
-		-- Continuous VL decay.
+		-- Continuous VL + strike decay.
 		local dt = t - rec.lastDecay
 		if dt > 0 then
 			rec.lastDecay = t
 			for k, v in pairs(rec.vl) do
 				local nv = v - Settings.VL.DecayPerSecond * dt
 				rec.vl[k] = nv > 0 and nv or 0
+			end
+			if rec.strikes > 0 then
+				rec.strikes = math.max(0, rec.strikes - Settings.BanManager.StrikeDecayPerSecond * dt)
+				rec.stateTable.strikes = rec.strikes
 			end
 		end
 	end
@@ -908,6 +1388,12 @@ RunService.PostSimulation:Connect(function()
 		warn("[NanoAC-R] drain error: " .. tostring(err))
 	end
 end)
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+for _, plr in ipairs(Players:GetPlayers()) do
+	onPlayerAdded(plr)
+end
 
 if Settings.Debug then
 	print("[NanoAC-R] Coordinator online. " .. tostring(#Players:GetPlayers()) .. " player(s) tracked.")
