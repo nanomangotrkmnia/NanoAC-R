@@ -1,0 +1,17 @@
+# Roblox binary/XML artifacts
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+# Rojo / build output
+/build/
+/sourcemap.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+refs:
+/Grim/

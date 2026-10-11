@@ -1,0 +1,27 @@
+{
+  "name": "NanoAC-R",
+  "tree": {
+    "$className": "DataModel",
+
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "NanoAC-R": {
+        "$path": "src/server/NanoAC-R"
+      }
+    },
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage"
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "NanoAC_AlertClient": {
+          "$path": "src/client/NanoAC_AlertClient.client.luau"
+        }
+      }
+    }
+  }
+}

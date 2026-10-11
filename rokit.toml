@@ -1,0 +1,4 @@
+# Toolchain (Rokit). Run `rokit install` to fetch these.
+# Adjust the rojo version to whatever is current for you (`rojo --version`).
+[tools]
+rojo = "rojo-rbx/rojo@7.4.4"
