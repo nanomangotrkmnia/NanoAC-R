@@ -493,6 +493,15 @@ local function publishConfig()
 	CONFIG.banWarnAt = bm.WarnAt
 	CONFIG.banKickAt = bm.KickAt
 	CONFIG.banDecay = bm.StrikeDecayPerSecond
+
+	-- Config generation: checks cache a local snapshot and rebuild it only when this
+	-- changes, so every read afterwards is a plain Luau table lookup.
+	CONFIG.revision = (CONFIG.revision or 0) + 1
+	-- Roster generation: bumped on join/leave so runCheck knows when its cached roster
+	-- array is stale (one shared read per tick instead of a full SharedTable iteration).
+	if CONFIG.rosterGen == nil then
+		CONFIG.rosterGen = 0
+	end
 end
 
 publishConfig()
@@ -502,6 +511,11 @@ publishConfig()
 -- =====================================================================================
 local function now()
 	return Workspace:GetServerTimeNow()
+end
+
+-- Invalidate the checks' cached roster arrays. Called on join/leave only.
+local function bumpRosterGen()
+	CONFIG.rosterGen = (CONFIG.rosterGen or 0) + 1
 end
 
 local function yawOf(root)
@@ -591,6 +605,10 @@ local function newRecord(plr)
 		angSpeed = 0,
 		whitelisted = false,
 		strikes = 0,
+		-- Precomputed exemption aggregates (see NanoShared.isExempt/isGrace): the checks
+		-- read one field instead of re-deriving the same booleans every frame.
+		exemptMove = true,
+		exemptGrace = true,
 	})
 	return {
 		player = plr,
@@ -634,6 +652,8 @@ local function onCharacterAdded(plr)
 	st.exemptUntil = rec.exemptUntil
 	st.dead = true
 	st.alive = false
+	st.exemptMove = true
+	st.exemptGrace = true
 end
 
 local function onPlayerAdded(plr)
@@ -655,6 +675,7 @@ local function onPlayerAdded(plr)
 	rec.lastDecay = now()
 	records[plr.UserId] = rec
 	ROSTER[plr.UserId] = rec.stateTable
+	bumpRosterGen()
 
 	if setupCommands then setupCommands(plr) end
 
@@ -682,6 +703,7 @@ end
 local function onPlayerRemoving(plr)
 	records[plr.UserId] = nil
 	ROSTER[plr.UserId] = nil
+	bumpRosterGen()
 end
 
 -- =====================================================================================
@@ -1103,11 +1125,40 @@ local function handleViolation(vrec, t)
 	end
 end
 
+-- The violation queue is fed from parallel checks and drained here once per frame. If the
+-- checks ever outrun the drainer (a mass flag burst, a very slow frame) we must not let the
+-- SharedTable grow without bound. Two guards:
+--   * MAX_DRAIN_PER_FRAME bounds the serial work this frame can do (keeps frame time sane);
+--   * MAX_QUEUE_BACKLOG drops the *oldest* surpluses when the backlog exceeds the cap, so
+--     memory is bounded and the freshest violations are the ones that survive.
+local MAX_DRAIN_PER_FRAME = 512
+local MAX_QUEUE_BACKLOG = 4096
+
 local function drainQueue(t)
 	local write = QUEUE["write"]
 	local read = QUEUE["read"]
 	if write <= read then return end
-	for i = read + 1, write do
+
+	-- Enforce the backlog cap before doing any work.
+	local backlog = write - read
+	if backlog > MAX_QUEUE_BACKLOG then
+		local drop = backlog - MAX_QUEUE_BACKLOG
+		local stop = read + drop
+		for i = read + 1, stop do
+			QUEUE[i] = nil
+		end
+		read = stop
+		QUEUE["read"] = read
+		if Settings.Debug then
+			warn(string.format("[NanoAC-R] violation queue overrun: dropped %d oldest", drop))
+		end
+	end
+
+	local target = write
+	if target - read > MAX_DRAIN_PER_FRAME then
+		target = read + MAX_DRAIN_PER_FRAME
+	end
+	for i = read + 1, target do
 		local vrec = QUEUE[i]
 		if vrec ~= nil then
 			local ok, err = pcall(handleViolation, vrec, t)
@@ -1117,7 +1168,7 @@ local function drainQueue(t)
 		end
 		QUEUE[i] = nil
 	end
-	QUEUE["read"] = write
+	QUEUE["read"] = target
 end
 
 -- =====================================================================================
@@ -1217,17 +1268,23 @@ local function sample(rec, t)
 	if char == nil then
 		st.dead = true
 		st.alive = false
+		st.exemptMove = true
+		st.exemptGrace = true
 		return
 	end
 	local hum = char:FindFirstChildOfClass("Humanoid")
 	local root = hum and hum.RootPart
 	if hum == nil or root == nil then
 		st.alive = false
+		st.exemptMove = true
+		st.exemptGrace = true
 		return
 	end
 	if hum.Health <= 0 then
 		st.dead = true
 		st.alive = false
+		st.exemptMove = true
+		st.exemptGrace = true
 		return
 	end
 
@@ -1324,7 +1381,12 @@ local function sample(rec, t)
 	st.airborne = not grounded
 	st.wasAirborne = rec.prevAirborne == true
 	rec.prevAirborne = not grounded
-	st.stateName = hstate.Name
+	-- Only republish the state name when the Humanoid actually changes state: this is the
+	-- one string field written every frame, and nothing reads it in the steady state.
+	if hstate ~= rec.lastHState then
+		rec.lastHState = hstate
+		st.stateName = hstate.Name
+	end
 	st.swim = swim
 	st.climb = climb
 	st.seated = seated
@@ -1357,6 +1419,14 @@ local function sample(rec, t)
 	st.swimInAir = (hstate == Enum.HumanoidStateType.Swimming) and (hum.FloorMaterial ~= Enum.Material.Water)
 	st.whitelisted = isWhitelisted(plr)
 	st.strikes = rec.strikes
+
+	-- Precomputed exemption aggregates consumed by NanoShared.isExempt/isGrace. Computed
+	-- here (once per player per frame) from the values we just published so the ~20 checks
+	-- each read a single field instead of re-evaluating the same booleans and windows.
+	-- `t` is the same sample time every caller passes, so semantics are identical.
+	local baseExempt = st.whitelisted or (t < rec.graceUntil) or (t < rec.exemptUntil)
+	st.exemptGrace = baseExempt
+	st.exemptMove = baseExempt or seated or swim or climb or platform or phys
 end
 
 RunService.PostSimulation:Connect(function()

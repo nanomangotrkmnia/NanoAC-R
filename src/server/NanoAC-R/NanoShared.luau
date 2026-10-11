@@ -35,26 +35,92 @@ NanoShared.Players = Players
 if NanoShared.queue["write"] == nil then NanoShared.queue["write"] = 0 end
 if NanoShared.queue["read"] == nil then NanoShared.queue["read"] = 0 end
 
--- Read a published config value, with a fallback when the Coordinator hasn't set it yet.
+--[[
+	Config snapshot.
+
+	A SharedTable read is not free: it crosses the shared boundary and takes the table's
+	lock. The checks read the same handful of config keys every frame for every player, so
+	reading them straight out of the SharedTable each time is pure overhead. Instead we
+	copy the whole (flat) config SharedTable into a plain Luau table once and answer
+	cfg()/cfgList() from that snapshot. The snapshot is rebuilt only when the Coordinator
+	bumps CONFIG.revision, which it does whenever it republishes config.
+
+	Each check Actor gets its own snapshot (a ModuleScript is per-Actor state), which is
+	exactly what we want: no cross-Actor sharing, nothing to synchronise.
+]]
+local cfgCache = {}
+local cfgBuilt = false
+local cfgRevision = nil
+
+-- Rebuild the local config snapshot if the Coordinator has published a new revision.
+-- Cheap no-op in the steady state.
+function NanoShared.syncConfig()
+	local rev = NanoShared.config.revision
+	if cfgBuilt and rev == cfgRevision then
+		return
+	end
+	local snapshot = {}
+	for k, v in NanoShared.config do
+		snapshot[k] = v
+	end
+	cfgCache = snapshot
+	cfgRevision = rev
+	cfgBuilt = true
+end
+
+-- Read a published config value from the local snapshot, with a fallback when the
+-- Coordinator hasn't set it yet. A miss refreshes once so a check that loaded before
+-- the Coordinator still picks the value up. Because the snapshot is only invalidated
+-- on a revision change, we also poll the revision every CFG_REVISION_POLL calls so a
+-- mid-session republish propagates without a shared read on every single access.
+local CFG_REVISION_POLL = 64
+local cfgCalls = 0
+
 function NanoShared.cfg(key, default)
-	local v = NanoShared.config[key]
+	local v = cfgCache[key]
 	if v == nil then
-		return default
+		NanoShared.syncConfig()
+		v = cfgCache[key]
+		if v == nil then
+			return default
+		end
+		return v
+	end
+	cfgCalls += 1
+	if cfgCalls >= CFG_REVISION_POLL then
+		cfgCalls = 0
+		if NanoShared.config.revision ~= cfgRevision then
+			NanoShared.syncConfig()
+			v = cfgCache[key]
+			if v == nil then
+				return default
+			end
+		end
 	end
 	return v
 end
 
 -- Split a delimited string config value into a list (used for name/pattern lists).
+-- The parse result is memoised per key and only recomputed when the raw string changes,
+-- so repeated calls in hot paths stop rebuilding the same table every time.
+local cfgListCache = {}   -- [key] = { raw = string, parsed = {string} }
+
 function NanoShared.cfgList(key, default)
-	local v = NanoShared.config[key]
+	local v = NanoShared.cfg(key, nil)
 	if type(v) == "string" then
+		local raw = v :: string
+		local cached = cfgListCache[key]
+		if cached ~= nil and cached.raw == raw then
+			return cached.parsed
+		end
 		local out = {}
-		for item in string.gmatch(v, "[^,]+") do
+		for item in string.gmatch(raw, "[^,]+") do
 			local trimmed = string.match(item, "^%s*(.-)%s*$")
 			if trimmed ~= "" then
 				out[#out + 1] = trimmed
 			end
 		end
+		cfgListCache[key] = { raw = raw, parsed = out }
 		return out
 	end
 	if type(v) == "table" then
@@ -90,38 +156,70 @@ end
 -- Canonical flag API used by every check. pushViolation is kept as an alias.
 NanoShared.flag = NanoShared.pushViolation
 
--- True when a check should ignore this player this frame. Exempts everything the brief
--- calls out: dead/respawning, seated, swimming, climbing, ragdoll/physics, platform
--- standing, spawn grace and teleport/teleport-whitelist grace.
+--[[
+	Exemption checks.
+
+	Every movement/death flag here is only ever published by the Coordinator's sample(),
+	so the Coordinator can precompute them as one aggregate (state.exemptMove / .exemptGrace)
+	and a check pays a single shared read instead of up to nine. The whitelist flag and the
+	grace windows, however, are also written asynchronously (ExemptTeleport, seat changes,
+	setbacks, the whitelist API), so those are still read live to keep the exact
+	same-frame behaviour. `now` is the caller's sample time.
+
+	The individual checks remain the fallback for any state table that predates the
+	aggregate fields.
+]]
 function NanoShared.isExempt(state, now)
 	if state == nil then return true end
+
+	local aggregate = state.exemptMove
+	if aggregate == true then return true end
+
+	-- Live values that can change between samples.
 	if state.whitelisted == true then return true end
+	local grace = state.graceUntil
+	if grace ~= nil and now < grace then return true end
+	local exempt = state.exemptUntil
+	if exempt ~= nil and now < exempt then return true end
+
+	-- With an aggregate present, the movement flags are authoritative (sample-only).
+	if aggregate ~= nil then
+		return false
+	end
+
+	-- No aggregate: fall back to the full original evaluation.
 	if state.dead == true then return true end
 	if state.seated == true then return true end
 	if state.swim == true then return true end
 	if state.climb == true then return true end
 	if state.platform == true then return true end
 	if state.phys == true then return true end
-	local grace = state.graceUntil
-	if grace ~= nil and now < grace then return true end
-	local exempt = state.exemptUntil
-	if exempt ~= nil and now < exempt then return true end
 	return false
 end
 
 -- Stricter variant that ignores the *movement* exemptions (swim/climb/seat/platform)
 -- but still honours death, whitelist and grace windows. Used by the property/state
 -- guards (HumanoidGuard, StateGuard, NoclipGuard, PhysicsGuard, ...) which must still
--- run while a player is seated/swimming.
+-- run while a player is seated/swimming. Aggregated as state.exemptGrace (see above).
 function NanoShared.isGrace(state, now)
 	if state == nil then return true end
+
+	local aggregate = state.exemptGrace
+	if aggregate == true then return true end
+
+	-- Live values that can change between samples.
 	if state.whitelisted == true then return true end
-	if state.dead == true then return true end
-	if state.alive == false then return true end
 	local grace = state.graceUntil
 	if grace ~= nil and now < grace then return true end
 	local exempt = state.exemptUntil
 	if exempt ~= nil and now < exempt then return true end
+
+	-- The aggregate is authoritative for the sample-only death flags.
+	if aggregate ~= nil then
+		return false
+	end
+	if state.dead == true then return true end
+	if state.alive == false then return true end
 	return false
 end
 
@@ -156,23 +254,62 @@ function NanoShared.runCheck(opts)
 	local errors = 0
 	local lastErrLog = 0
 
+	--[[
+		Roster snapshot.
+
+		Iterating the roster SharedTable costs a locked shared read per element every tick.
+		Membership changes rarely, so instead we cache a plain Luau array of the (userId,
+		state) pairs and iterate that with a numeric for-loop. The array is rebuilt only
+		when the Coordinator bumps CONFIG.rosterGen on join/leave (one shared read per
+		tick to notice the change). Field reads from each state are unchanged, but the
+		iteration machinery no longer touches the SharedTable every check every frame.
+	]]
+	local snapshot = {}       -- [i] = state
+	local snapshotIds = {}    -- [i] = userId
+	local snapshotCount = 0
+	local rosterGen = nil
+
+	local function rebuildRoster()
+		local n = 0
+		for userId, state in NanoShared.roster do
+			n += 1
+			snapshot[n] = state
+			snapshotIds[n] = userId
+		end
+		for i = n + 1, snapshotCount do
+			snapshot[i] = nil
+			snapshotIds[i] = nil
+		end
+		snapshotCount = n
+	end
+
+	-- Defined once (not per tick) so the frame path allocates no closures.
+	local function runRoster()
+		for i = 1, snapshotCount do
+			local state = snapshot[i]
+			local t = state.time
+			if t ~= nil and t > 0 then
+				if state.dead == true or state.alive == false then
+					if reset ~= nil then reset(snapshotIds[i]) end
+				else
+					process(state, snapshotIds[i], t)
+				end
+			end
+		end
+	end
+
 	local function tick()
 		if disabled then return end
 		if NanoShared.cfg("paused", false) then return end
 		if enabledKey ~= nil and NanoShared.cfg(enabledKey, true) == false then return end
 
-		local ok, err = pcall(function()
-			for userId, state in NanoShared.roster do
-				local t = state.time
-				if t ~= nil and t > 0 then
-					if state.dead == true or state.alive == false then
-						if reset ~= nil then reset(userId) end
-					else
-						process(state, userId, t)
-					end
-				end
-			end
-		end)
+		local gen = NanoShared.config.rosterGen
+		if gen ~= rosterGen then
+			rosterGen = gen
+			rebuildRoster()
+		end
+
+		local ok, err = pcall(runRoster)
 
 		if not ok then
 			errors += 1

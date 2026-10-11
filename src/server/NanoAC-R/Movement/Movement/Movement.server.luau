@@ -19,11 +19,52 @@ local Shared = require(rootActor:WaitForChild("NanoShared"))
 local CHECK = "Movement"
 local roster = Shared.roster
 
-local tracks = {}    -- [userId] = { samples = {{t, disp, veldt}}, windowStart = t }
+--[[
+	Per-player rolling window.
+
+	The old version stored samples in a plain array and dropped the front with
+	table.remove(samples, 1). table.remove shifts every remaining element, so trimming
+	and summing the window were both O(n) every frame -> O(n^2) over a session in the
+	hottest path. This is a fixed-capacity ring buffer with running totals:
+
+	  * samples live in three parallel numeric arrays addressed by a slot index;
+	  * head/count track the live range, so eviction is `head = head % cap + 1` (O(1));
+	  * sumD/sumV are maintained incrementally, so the per-frame total is O(1) not O(n).
+
+	The window length, tolerances and streak rules below are unchanged.
+]]
+local tracks = {}    -- [userId] = ring buffer track
 local streak = {}
 local lastEmit = {}
 
 local WINDOW = 0.35
+local SAMPLE_CAP = 128   -- >= WINDOW / min-dt for any sane server frame rate
+
+local function newTrack(t, pos)
+	return {
+		sT = table.create(SAMPLE_CAP),   -- sample times
+		sD = table.create(SAMPLE_CAP),   -- displacement per step
+		sV = table.create(SAMPLE_CAP),   -- velocity integral per step
+		head = 1,                        -- slot of the oldest live sample
+		count = 0,                       -- live samples
+		sumD = 0,
+		sumV = 0,
+		windowStart = t,
+		prevPos = pos,
+		prevT = t,
+	}
+end
+
+-- Clear a track in place (reuses the allocated arrays: no per-reset garbage).
+local function resetTrack(tr, t, pos)
+	tr.head = 1
+	tr.count = 0
+	tr.sumD = 0
+	tr.sumV = 0
+	tr.windowStart = t
+	tr.prevPos = pos
+	tr.prevT = t
+end
 
 local function reset(userId)
 	tracks[userId] = nil
@@ -36,28 +77,16 @@ local function process(state, userId, t)
 
 	local tr = tracks[userId]
 	if tr == nil then
-		tr = { samples = {}, windowStart = t, prevPos = pos, prevT = t }
+		tr = newTrack(t, pos)
 		tracks[userId] = tr
 		return
 	end
 
 	local dt = t - tr.prevT
 	if dt <= 0.001 then return end
-	if dt > 0.5 then
-		-- lag spike / rebaseline
-		tr.samples = {}
-		tr.windowStart = t
-		tr.prevPos = pos
-		tr.prevT = t
-		streak[userId] = 0
-		return
-	end
-
-	if Shared.isExempt(state, t) then
-		tr.samples = {}
-		tr.windowStart = t
-		tr.prevPos = pos
-		tr.prevT = t
+	if dt > 0.5 or Shared.isExempt(state, t) then
+		-- lag spike / rebaseline, or an exempt movement state
+		resetTrack(tr, t, pos)
 		streak[userId] = 0
 		return
 	end
@@ -67,20 +96,39 @@ local function process(state, userId, t)
 	local disp = (pos - tr.prevPos).Magnitude
 	tr.prevPos = pos
 	tr.prevT = t
-	tr.samples[#tr.samples + 1] = { t = t, d = disp, v = speed * dt }
 
-	-- drop samples that left the rolling window
-	while #tr.samples >= 2 and tr.samples[1].t < t - WINDOW do
-		table.remove(tr.samples, 1)
+	-- Push the new sample into the ring, keeping the running totals. On the (unrealistic)
+	-- event of a full ring, evict the oldest slot first so the cap is hard.
+	local cap = SAMPLE_CAP
+	local head, count = tr.head, tr.count
+	if count >= cap then
+		tr.sumD -= tr.sD[head]
+		tr.sumV -= tr.sV[head]
+		head = head % cap + 1
+		count -= 1
 	end
-	tr.windowStart = tr.samples[1] and tr.samples[1].t or t
+	local slot = (head - 1 + count) % cap + 1
+	tr.sT[slot] = t
+	tr.sD[slot] = disp
+	tr.sV[slot] = speed * dt
+	count += 1
+	tr.sumD += disp
+	tr.sumV += speed * dt
+
+	-- Drop samples that have left the rolling window from the front.
+	local cutoff = t - WINDOW
+	while count >= 2 and tr.sT[head] < cutoff do
+		tr.sumD -= tr.sD[head]
+		tr.sumV -= tr.sV[head]
+		head = head % cap + 1
+		count -= 1
+	end
+	tr.head = head
+	tr.count = count
+	tr.windowStart = count > 0 and tr.sT[head] or t
 
 	local duration = t - tr.windowStart
-	local totalDisp, totalVel = 0, 0
-	for _, s in ipairs(tr.samples) do
-		totalDisp += s.d
-		totalVel += s.v
-	end
+	local totalDisp, totalVel = tr.sumD, tr.sumV
 
 	local minMove = Shared.cfg("movementMinMove", 5)
 	local slack = Shared.cfg("movementVelocitySlack", 1.8)
