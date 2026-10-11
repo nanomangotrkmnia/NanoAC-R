@@ -22,95 +22,147 @@ NanoShared.NAMES = {
 	ROSTER = "NanoAC_Roster",
 	QUEUE = "NanoAC_Queue",
 	CONFIG = "NanoAC_Config",
+	ROSTER_EVENTS = "NanoAC_RosterEvents",
 }
 
 -- Resolve the shared handles once, at require time (serial).
 NanoShared.roster = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.ROSTER)
-NanoShared.queue = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.QUEUE)
 NanoShared.config = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.CONFIG)
+NanoShared.rosterEvents = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.ROSTER_EVENTS)
 NanoShared.Players = Players
 
--- The queue is a growable array addressed by two numeric cursors. SharedTable.increment
--- requires the key to already exist and be numeric, so seed them if they are absent.
-if NanoShared.queue["write"] == nil then NanoShared.queue["write"] = 0 end
-if NanoShared.queue["read"] == nil then NanoShared.queue["read"] = 0 end
+--[[
+	Violation queues  (perf fix 6).
+
+	Every check used to contend on a single SharedTable's "write" counter, which
+	serialises parallel flag writers under load. Violations are now spread across
+	QUEUE_SHARDS independent queues, selected deterministically from the check name, so
+	flags from different checks rarely touch the same atomic counter. Shard 1 keeps the
+	documented "NanoAC_Queue" name; the rest are "NanoAC_Queue_<i>".
+
+	A queue is a growable array addressed by two numeric cursors. SharedTable.increment
+	requires the key to already exist and be numeric, so seed them if they are absent.
+]]
+local QUEUE_SHARDS = 8
+NanoShared.QUEUE_SHARDS = QUEUE_SHARDS
+NanoShared.queues = {}
+NanoShared.queues[1] = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.QUEUE)
+for i = 2, QUEUE_SHARDS do
+	NanoShared.queues[i] = SharedTableRegistry:GetSharedTable(NanoShared.NAMES.QUEUE .. "_" .. i)
+end
+for i = 1, QUEUE_SHARDS do
+	local q = NanoShared.queues[i]
+	if q["write"] == nil then q["write"] = 0 end
+	if q["read"] == nil then q["read"] = 0 end
+end
+-- Backwards-compatible alias for the primary shard.
+NanoShared.queue = NanoShared.queues[1]
+
+-- Seed the roster-event log runCheck uses to track joins/leaves incrementally.
+if NanoShared.rosterEvents["write"] == nil then NanoShared.rosterEvents["write"] = 0 end
+if NanoShared.rosterEvents["first"] == nil then NanoShared.rosterEvents["first"] = 1 end
+NanoShared.ROSTER_EVENT_WINDOW = 8192
 
 --[[
-	Config snapshot.
+	Config snapshot  (perf fixes 1, 3, 4).
 
-	A SharedTable read is not free: it crosses the shared boundary and takes the table's
-	lock. The checks read the same handful of config keys every frame for every player, so
-	reading them straight out of the SharedTable each time is pure overhead. Instead we
-	copy the whole (flat) config SharedTable into a plain Luau table once and answer
-	cfg()/cfgList() from that snapshot. The snapshot is rebuilt only when the Coordinator
-	bumps CONFIG.revision, which it does whenever it republishes config.
+	Reading config out of the SharedTable every frame for every check is pure overhead.
+	The Coordinator publishes the whole (flat) config as a single nested SharedTable
+	(CONFIG.snapshot) in one batched write and bumps CONFIG.revision. Each check Actor
+	keeps a plain Luau copy of that snapshot and answers cfg()/cfgList() from it.
 
-	Each check Actor gets its own snapshot (a ModuleScript is per-Actor state), which is
-	exactly what we want: no cross-Actor sharing, nothing to synchronise.
+	Parallel threads cannot connect to signals, so rather than polling the revision on
+	every Nth call (perf fix 1) we refresh on a lightweight timer task. cfg() is then a
+	pure table lookup with no shared access on the hot path.
 ]]
 local cfgCache = {}
 local cfgBuilt = false
 local cfgRevision = nil
 
--- Rebuild the local config snapshot if the Coordinator has published a new revision.
--- Cheap no-op in the steady state.
+-- Rebuild the local snapshot from CONFIG.snapshot when the revision changes.
 function NanoShared.syncConfig()
 	local rev = NanoShared.config.revision
 	if cfgBuilt and rev == cfgRevision then
 		return
 	end
 	local snapshot = {}
-	for k, v in NanoShared.config do
-		snapshot[k] = v
+	local src = NanoShared.config.snapshot
+	if typeof(src) == "SharedTable" then
+		for k, v in src do
+			snapshot[k] = v
+		end
 	end
 	cfgCache = snapshot
 	cfgRevision = rev
 	cfgBuilt = true
 end
 
--- Read a published config value from the local snapshot, with a fallback when the
--- Coordinator hasn't set it yet. A miss refreshes once so a check that loaded before
--- the Coordinator still picks the value up. Because the snapshot is only invalidated
--- on a revision change, we also poll the revision every CFG_REVISION_POLL calls so a
--- mid-session republish propagates without a shared read on every single access.
-local CFG_REVISION_POLL = 64
-local cfgCalls = 0
+-- Periodic refresh: one revision read per interval per Actor, replacing the per-call
+-- call-count polling. A config republish propagates within CFG_SYNC_INTERVAL.
+local CFG_SYNC_INTERVAL = 0.5
+if not NanoShared._configSyncing then
+	NanoShared._configSyncing = true
+	task.spawn(function()
+		while true do
+			NanoShared.syncConfig()
+			task.wait(CFG_SYNC_INTERVAL)
+		end
+	end)
+end
 
+-- Pure local lookup. A miss triggers one refresh so a check that loaded before the
+-- Coordinator still picks values up; afterwards it is answered from the plain table.
 function NanoShared.cfg(key, default)
 	local v = cfgCache[key]
-	if v == nil then
-		NanoShared.syncConfig()
-		v = cfgCache[key]
-		if v == nil then
-			return default
-		end
+	if v ~= nil then
 		return v
 	end
-	cfgCalls += 1
-	if cfgCalls >= CFG_REVISION_POLL then
-		cfgCalls = 0
-		if NanoShared.config.revision ~= cfgRevision then
-			NanoShared.syncConfig()
-			v = cfgCache[key]
-			if v == nil then
-				return default
-			end
-		end
+	NanoShared.syncConfig()
+	v = cfgCache[key]
+	if v == nil then
+		return default
 	end
 	return v
 end
 
--- Split a delimited string config value into a list (used for name/pattern lists).
--- The parse result is memoised per key and only recomputed when the raw string changes,
--- so repeated calls in hot paths stop rebuilding the same table every time.
-local cfgListCache = {}   -- [key] = { raw = string, parsed = {string} }
+--[[
+	Comma-list config  (perf fix 3).
+
+	The Coordinator pre-parses the raw delimited strings at publish time into
+	"<key>List" SharedTable arrays, so the check Actors never run gmatch/match on them.
+	The converted Luau array is memoised per published list (and the string form remains
+	a fallback for compatibility).
+]]
+local cfgListCache = {}   -- [key] = { src = any, parsed = {string} }
+
+local function copySharedList(st)
+	local out = {}
+	local n = SharedTable.size(st)
+	for i = 1, n do
+		out[i] = st[i]
+	end
+	return out
+end
 
 function NanoShared.cfgList(key, default)
+	-- Prefer the pre-parsed array published as "<key>List".
+	local pre = NanoShared.cfg(key .. "List", nil)
+	if typeof(pre) == "SharedTable" then
+		local cached = cfgListCache[key]
+		if cached ~= nil and cached.src == pre then
+			return cached.parsed
+		end
+		local parsed = copySharedList(pre)
+		cfgListCache[key] = { src = pre, parsed = parsed }
+		return parsed
+	end
+
+	-- Fallback: parse the raw string once and memoise it.
 	local v = NanoShared.cfg(key, nil)
 	if type(v) == "string" then
 		local raw = v :: string
 		local cached = cfgListCache[key]
-		if cached ~= nil and cached.raw == raw then
+		if cached ~= nil and cached.src == raw then
 			return cached.parsed
 		end
 		local out = {}
@@ -120,7 +172,7 @@ function NanoShared.cfgList(key, default)
 				out[#out + 1] = trimmed
 			end
 		end
-		cfgListCache[key] = { raw = raw, parsed = out }
+		cfgListCache[key] = { src = raw, parsed = out }
 		return out
 	end
 	if type(v) == "table" then
@@ -139,12 +191,35 @@ function NanoShared.pushQueue(queue, payload)
 	return index
 end
 
+-- Deterministic shard for a check name (perf fix 6). Cached because every check emits
+-- hundreds of times with the same constant name.
+local shardCache = {}
+local function shardFor(checkName)
+	local s = shardCache[checkName]
+	if s ~= nil then
+		return s
+	end
+	-- Small bit32 mixer (FNV offset basis + xor-shift) so the fixed check names spread
+	-- evenly across shards without any large-number precision loss.
+	local h = 2166136261
+	for i = 1, #checkName do
+		h = bit32.bxor(h, string.byte(checkName, i))
+		h = bit32.band(h + bit32.lshift(h, 5), 0xFFFFFFFF)
+		h = bit32.bxor(h, bit32.rshift(h, 4))
+	end
+	s = 1 + (h % QUEUE_SHARDS)
+	shardCache[checkName] = s
+	return s
+end
+
 -- Push a confirmed violation onto the shared queue. Safe to call in parallel.
 -- Returns the slot index it wrote to.
 function NanoShared.pushViolation(userId, checkName, magnitude, detail)
-	local old = SharedTable.increment(NanoShared.queue, "write", 1)
+	if checkName == nil then checkName = "Check" end
+	local queue = NanoShared.queues[shardFor(checkName)]
+	local old = SharedTable.increment(queue, "write", 1)
 	local index = old + 1
-	NanoShared.queue[index] = SharedTable.new({
+	queue[index] = SharedTable.new({
 		userId = userId,
 		check = checkName,
 		magnitude = magnitude or 0,
@@ -255,32 +330,102 @@ function NanoShared.runCheck(opts)
 	local lastErrLog = 0
 
 	--[[
-		Roster snapshot.
+		Roster snapshot  (perf fix 2).
 
-		Iterating the roster SharedTable costs a locked shared read per element every tick.
-		Membership changes rarely, so instead we cache a plain Luau array of the (userId,
-		state) pairs and iterate that with a numeric for-loop. The array is rebuilt only
-		when the Coordinator bumps CONFIG.rosterGen on join/leave (one shared read per
-		tick to notice the change). Field reads from each state are unchanged, but the
-		iteration machinery no longer touches the SharedTable every check every frame.
+		Iterating the roster SharedTable costs a locked shared read per element every tick,
+		so each check keeps a plain Luau array of (userId, state) pairs and iterates that.
+		Join/leave are applied incrementally from the Coordinator's roster-event log
+		(ROSTER_EVENTS) instead of rebuilding the whole array O(n) on every membership
+		change. An index map keeps add/remove O(1). If a check falls behind the retained
+		event window (e.g. it was disabled for a while) it does one authoritative rebuild.
 	]]
-	local snapshot = {}       -- [i] = state
-	local snapshotIds = {}    -- [i] = userId
+	local snapshot = {}        -- [i] = state
+	local snapshotIds = {}     -- [i] = userId
+	local snapshotIndex = {}   -- [userId] = i
 	local snapshotCount = 0
-	local rosterGen = nil
+	local eventRead = 0
 
-	local function rebuildRoster()
+	local function addEntry(userId, state)
+		local n = snapshotCount + 1
+		snapshot[n] = state
+		snapshotIds[n] = userId
+		snapshotIndex[userId] = n
+		snapshotCount = n
+	end
+
+	local function removeEntry(userId)
+		local slot = snapshotIndex[userId]
+		if slot == nil then
+			return
+		end
+		local last = snapshotCount
+		if slot ~= last then
+			local movedState = snapshot[last]
+			local movedId = snapshotIds[last]
+			snapshot[slot] = movedState
+			snapshotIds[slot] = movedId
+			snapshotIndex[movedId] = slot
+		end
+		snapshot[last] = nil
+		snapshotIds[last] = nil
+		snapshotIndex[userId] = nil
+		snapshotCount = last - 1
+	end
+
+	local function fullRebuild()
+		local events = NanoShared.rosterEvents
+		-- Read the write cursor before iterating so a join racing this rebuild is
+		-- picked up from its event on the next tick rather than being skipped.
+		local writeAtStart = events["write"] or 0
+		for i = 1, snapshotCount do
+			local id = snapshotIds[i]
+			if id ~= nil then
+				snapshotIndex[id] = nil
+			end
+			snapshot[i] = nil
+			snapshotIds[i] = nil
+		end
+		snapshotCount = 0
 		local n = 0
 		for userId, state in NanoShared.roster do
 			n += 1
 			snapshot[n] = state
 			snapshotIds[n] = userId
-		end
-		for i = n + 1, snapshotCount do
-			snapshot[i] = nil
-			snapshotIds[i] = nil
+			snapshotIndex[userId] = n
 		end
 		snapshotCount = n
+		eventRead = writeAtStart
+	end
+
+	local function applyRosterEvents()
+		local events = NanoShared.rosterEvents
+		local write = events["write"] or 0
+		local first = events["first"] or 1
+		if eventRead + 1 < first then
+			-- Fell behind the retained window: one authoritative rebuild.
+			fullRebuild()
+			return
+		end
+		if write <= eventRead then
+			return
+		end
+		for i = eventRead + 1, write do
+			local ev = events[i]
+			if ev ~= nil then
+				local userId = ev.userId
+				if ev.add == true then
+					if snapshotIndex[userId] == nil then
+						local state = NanoShared.roster[userId]
+						if state ~= nil then
+							addEntry(userId, state)
+						end
+					end
+				else
+					removeEntry(userId)
+				end
+			end
+		end
+		eventRead = write
 	end
 
 	-- Defined once (not per tick) so the frame path allocates no closures.
@@ -298,18 +443,20 @@ function NanoShared.runCheck(opts)
 		end
 	end
 
+	-- MicroProfiler label (perf instrumentation): open the MicroProfiler in Studio to see
+	-- each check's parallel cost and any SharedTable stalls under peak player load.
+	local profileLabel = "NanoAC-R " .. check
+
 	local function tick()
 		if disabled then return end
 		if NanoShared.cfg("paused", false) then return end
 		if enabledKey ~= nil and NanoShared.cfg(enabledKey, true) == false then return end
 
-		local gen = NanoShared.config.rosterGen
-		if gen ~= rosterGen then
-			rosterGen = gen
-			rebuildRoster()
-		end
+		applyRosterEvents()
 
+		debug.profilebegin(profileLabel)
 		local ok, err = pcall(runRoster)
+		debug.profileend()
 
 		if not ok then
 			errors += 1

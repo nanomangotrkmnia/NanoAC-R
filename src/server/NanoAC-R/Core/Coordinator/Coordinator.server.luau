@@ -27,6 +27,16 @@
 	    │                     PhysicsGuard, HealthGuard, HitboxGuard }
 	    ├─ Combat/         { ThroughWall, Velocity, Hit, Fling, FireRate }
 	    └─ Network/        { RemoteGuard, ToolGuard, ExploitGuard }
+
+	PERF NOTES (see the "perf fix N" comments throughout)
+	  * Config is published once as a single nested SharedTable (CONFIG.snapshot) and the
+	    checks cache a plain copy of it; a timer task refreshes that copy on revision change.
+	  * Violations are sharded across NanoAC_Queue / NanoAC_Queue_2..8 to lower write
+	    contention between parallel checks.
+	  * Joins/leaves are published as a bounded event log so checks update incrementally.
+	  * Per-player state is dirty-checked so unchanged fields are not republished.
+	  To measure contention/frame cost: open Studio's MicroProfiler and look for the
+	  "NanoAC-R sample", "NanoAC-R drainQueue" and per-check "NanoAC-R <Check>" labels.
 	=====================================================================================
 ]]
 
@@ -40,8 +50,10 @@ local rootActor = script:FindFirstAncestor("NanoAC-R")
 local Shared = require(rootActor:WaitForChild("NanoShared"))
 
 local ROSTER = Shared.roster
-local QUEUE = Shared.queue
 local CONFIG = Shared.config
+local ROSTER_EVENTS = Shared.rosterEvents
+local QUEUES = Shared.queues
+local QUEUE_SHARDS = Shared.QUEUE_SHARDS
 
 -- Combat / sensor event queues: the game reports actions via bindables; the checks
 -- drain + validate these from parallel (except the serial network sensors).
@@ -55,13 +67,8 @@ local function seed(queue)
 	if queue["read"] == nil then queue["read"] = 0 end
 end
 seed(HITS); seed(KNOCKS); seed(HITGUARD); seed(SHOTS); seed(HEALS)
-
--- expose them to the combat checks
-CONFIG.hitsName = "NanoAC_Hits"
-CONFIG.knocksName = "NanoAC_Knockbacks"
-CONFIG.hitguardName = "NanoAC_HitGuard"
-CONFIG.shotsName = "NanoAC_Shots"
-CONFIG.healsName = "NanoAC_Heals"
+-- Violation shards are seeded by NanoShared at require time. The sensor queue names are
+-- published to the checks as part of the config snapshot (see publishConfig).
 
 -- =====================================================================================
 --  SETTINGS  (everything is tunable here; the checks read a mirrored copy of this table)
@@ -317,120 +324,137 @@ local Settings = {
 -- =====================================================================================
 --  PUBLISH CONFIG  (mirror the numeric/bool settings into a SharedTable for the checks)
 -- =====================================================================================
-local function publishLegacy()
+-- Split a comma-delimited settings string into an array (perf fix 3: parsed once here,
+-- at publish time, instead of on every cfgList() call in the checks).
+local function parseCsvList(raw)
+	local out = {}
+	if type(raw) == "string" then
+		for item in string.gmatch(raw, "[^,]+") do
+			local trimmed = string.match(item, "^%s*(.-)%s*$")
+			if trimmed ~= "" then
+				out[#out + 1] = trimmed
+			end
+		end
+	end
+	return out
+end
+
+-- Legacy checks are filled into the flat config table supplied by publishConfig, so the
+-- whole config is written to the SharedTable in a single batched operation (perf fix 4).
+local function fillLegacy(flat)
 	local p = Settings.Checks.Phase
-	CONFIG.phaseEnabled = p.Enabled
-	CONFIG.phaseVlThreshold = p.VLThreshold
-	CONFIG.phaseRequiredStreak = p.RequiredStreak
-	CONFIG.phaseEmitCooldown = p.EmitCooldown
-	CONFIG.phaseMinMove = p.MinMove
-	CONFIG.phaseMinPartThickness = p.MinPartThickness
-	CONFIG.phaseMaxTransparency = p.MaxTransparency
-	CONFIG.phaseSpeedFactor = p.SpeedFactor
-	CONFIG.phaseMaxSegment = p.MaxSegment
+	flat.phaseEnabled = p.Enabled
+	flat.phaseVlThreshold = p.VLThreshold
+	flat.phaseRequiredStreak = p.RequiredStreak
+	flat.phaseEmitCooldown = p.EmitCooldown
+	flat.phaseMinMove = p.MinMove
+	flat.phaseMinPartThickness = p.MinPartThickness
+	flat.phaseMaxTransparency = p.MaxTransparency
+	flat.phaseSpeedFactor = p.SpeedFactor
+	flat.phaseMaxSegment = p.MaxSegment
 
 	local s = Settings.Checks.Speed
-	CONFIG.speedEnabled = s.Enabled
-	CONFIG.speedVlThreshold = s.VLThreshold
-	CONFIG.speedRequiredStreak = s.RequiredStreak
-	CONFIG.speedEmitCooldown = s.EmitCooldown
-	CONFIG.speedMaxMultiplier = s.MaxMultiplier
-	CONFIG.speedPingAllowance = s.PingAllowance
-	CONFIG.speedAbsoluteCap = s.AbsoluteCap
-	CONFIG.speedMinSpeed = s.MinSpeed
-	CONFIG.speedWindow = s.Window
+	flat.speedEnabled = s.Enabled
+	flat.speedVlThreshold = s.VLThreshold
+	flat.speedRequiredStreak = s.RequiredStreak
+	flat.speedEmitCooldown = s.EmitCooldown
+	flat.speedMaxMultiplier = s.MaxMultiplier
+	flat.speedPingAllowance = s.PingAllowance
+	flat.speedAbsoluteCap = s.AbsoluteCap
+	flat.speedMinSpeed = s.MinSpeed
+	flat.speedWindow = s.Window
 
 	local a = Settings.Checks.FlightA
-	CONFIG.flightAEnabled = a.Enabled
-	CONFIG.flightAVlThreshold = a.VLThreshold
-	CONFIG.flightARequiredStreak = a.RequiredStreak
-	CONFIG.flightAEmitCooldown = a.EmitCooldown
-	CONFIG.flightAMaxMultiplier = a.MaxMultiplier
-	CONFIG.flightAMinSpeed = a.MinSpeed
-	CONFIG.flightAGainMultiplier = a.GainMultiplier
-	CONFIG.flightAGainWindow = a.GainWindow
-	CONFIG.flightALeniency = a.Leniency
+	flat.flightAEnabled = a.Enabled
+	flat.flightAVlThreshold = a.VLThreshold
+	flat.flightARequiredStreak = a.RequiredStreak
+	flat.flightAEmitCooldown = a.EmitCooldown
+	flat.flightAMaxMultiplier = a.MaxMultiplier
+	flat.flightAMinSpeed = a.MinSpeed
+	flat.flightAGainMultiplier = a.GainMultiplier
+	flat.flightAGainWindow = a.GainWindow
+	flat.flightALeniency = a.Leniency
 
 	local g2 = Settings.Checks.FlightB
-	CONFIG.flightBEnabled = g2.Enabled
-	CONFIG.flightBVlThreshold = g2.VLThreshold
-	CONFIG.flightBRequiredStreak = g2.RequiredStreak
-	CONFIG.flightBEmitCooldown = g2.EmitCooldown
-	CONFIG.flightBMaxDescent = g2.MaxDescent
-	CONFIG.flightBMinAirTime = g2.MinAirTime
+	flat.flightBEnabled = g2.Enabled
+	flat.flightBVlThreshold = g2.VLThreshold
+	flat.flightBRequiredStreak = g2.RequiredStreak
+	flat.flightBEmitCooldown = g2.EmitCooldown
+	flat.flightBMaxDescent = g2.MaxDescent
+	flat.flightBMinAirTime = g2.MinAirTime
 
 	local d = Settings.Checks.FlightC
-	CONFIG.flightCEnabled = d.Enabled
-	CONFIG.flightCVlThreshold = d.VLThreshold
-	CONFIG.flightCRequiredStreak = d.RequiredStreak
-	CONFIG.flightCEmitCooldown = d.EmitCooldown
-	CONFIG.flightCMinFallTime = d.MinFallTime
-	CONFIG.flightCExpectedRatio = d.ExpectedRatio
-	CONFIG.flightCMinFallSpeed = d.MinFallSpeed
+	flat.flightCEnabled = d.Enabled
+	flat.flightCVlThreshold = d.VLThreshold
+	flat.flightCRequiredStreak = d.RequiredStreak
+	flat.flightCEmitCooldown = d.EmitCooldown
+	flat.flightCMinFallTime = d.MinFallTime
+	flat.flightCExpectedRatio = d.ExpectedRatio
+	flat.flightCMinFallSpeed = d.MinFallSpeed
 
 	local fd = Settings.Checks.FlightD
-	CONFIG.flightDEnabled = fd.Enabled
-	CONFIG.flightDVlThreshold = fd.VLThreshold
-	CONFIG.flightDRequiredStreak = fd.RequiredStreak
-	CONFIG.flightDEmitCooldown = fd.EmitCooldown
-	CONFIG.flightDAirDelay = fd.AirDelay
-	CONFIG.flightDMinRise = fd.MinRise
+	flat.flightDEnabled = fd.Enabled
+	flat.flightDVlThreshold = fd.VLThreshold
+	flat.flightDRequiredStreak = fd.RequiredStreak
+	flat.flightDEmitCooldown = fd.EmitCooldown
+	flat.flightDAirDelay = fd.AirDelay
+	flat.flightDMinRise = fd.MinRise
 
 	local st = Settings.Checks.Step
-	CONFIG.stepEnabled = st.Enabled
-	CONFIG.stepVlThreshold = st.VLThreshold
-	CONFIG.stepRequiredStreak = st.RequiredStreak
-	CONFIG.stepEmitCooldown = st.EmitCooldown
-	CONFIG.stepMaxStep = st.MaxStep
+	flat.stepEnabled = st.Enabled
+	flat.stepVlThreshold = st.VLThreshold
+	flat.stepRequiredStreak = st.RequiredStreak
+	flat.stepEmitCooldown = st.EmitCooldown
+	flat.stepMaxStep = st.MaxStep
 
 	local sp = Settings.Checks.Spider
-	CONFIG.spiderEnabled = sp.Enabled
-	CONFIG.spiderVlThreshold = sp.VLThreshold
-	CONFIG.spiderRequiredStreak = sp.RequiredStreak
-	CONFIG.spiderEmitCooldown = sp.EmitCooldown
-	CONFIG.spiderMinClimbSpeed = sp.MinClimbSpeed
-	CONFIG.spiderMinSustain = sp.MinSustain
-	CONFIG.spiderWallDistance = sp.WallDistance
+	flat.spiderEnabled = sp.Enabled
+	flat.spiderVlThreshold = sp.VLThreshold
+	flat.spiderRequiredStreak = sp.RequiredStreak
+	flat.spiderEmitCooldown = sp.EmitCooldown
+	flat.spiderMinClimbSpeed = sp.MinClimbSpeed
+	flat.spiderMinSustain = sp.MinSustain
+	flat.spiderWallDistance = sp.WallDistance
 
 	local tw = Settings.Checks.ThroughWall
-	CONFIG.throughWallEnabled = tw.Enabled
-	CONFIG.throughWallVlThreshold = tw.VLThreshold
-	CONFIG.throughWallRequiredStreak = tw.RequiredStreak
-	CONFIG.throughWallEmitCooldown = tw.EmitCooldown
-	CONFIG.throughWallStartOffset = tw.StartOffset
-	CONFIG.throughWallEndOffset = tw.EndOffset
+	flat.throughWallEnabled = tw.Enabled
+	flat.throughWallVlThreshold = tw.VLThreshold
+	flat.throughWallRequiredStreak = tw.RequiredStreak
+	flat.throughWallEmitCooldown = tw.EmitCooldown
+	flat.throughWallStartOffset = tw.StartOffset
+	flat.throughWallEndOffset = tw.EndOffset
 
 	local ve = Settings.Checks.Velocity
-	CONFIG.velocityEnabled = ve.Enabled
-	CONFIG.velocityVlThreshold = ve.VLThreshold
-	CONFIG.velocityRequiredStreak = ve.RequiredStreak
-	CONFIG.velocityEmitCooldown = ve.EmitCooldown
-	CONFIG.velocityMinKnockback = ve.MinKnockback
-	CONFIG.velocityRatio = ve.Ratio
-	CONFIG.velocityWindow = ve.Window
-	CONFIG.velocityRoom = ve.Room
+	flat.velocityEnabled = ve.Enabled
+	flat.velocityVlThreshold = ve.VLThreshold
+	flat.velocityRequiredStreak = ve.RequiredStreak
+	flat.velocityEmitCooldown = ve.EmitCooldown
+	flat.velocityMinKnockback = ve.MinKnockback
+	flat.velocityRatio = ve.Ratio
+	flat.velocityWindow = ve.Window
+	flat.velocityRoom = ve.Room
 
 	local tm = Settings.Checks.Timer
-	CONFIG.timerEnabled = tm.Enabled
-	CONFIG.timerVlThreshold = tm.VLThreshold
-	CONFIG.timerRequiredStreak = tm.RequiredStreak
-	CONFIG.timerEmitCooldown = tm.EmitCooldown
-	CONFIG.timerWindow = tm.Window
-	CONFIG.timerAllowedRatio = tm.AllowedRatio
-	CONFIG.timerMinSamples = tm.MinSamples
-	CONFIG.timerMinSpeed = tm.MinSpeed
+	flat.timerEnabled = tm.Enabled
+	flat.timerVlThreshold = tm.VLThreshold
+	flat.timerRequiredStreak = tm.RequiredStreak
+	flat.timerEmitCooldown = tm.EmitCooldown
+	flat.timerWindow = tm.Window
+	flat.timerAllowedRatio = tm.AllowedRatio
+	flat.timerMinSamples = tm.MinSamples
+	flat.timerMinSpeed = tm.MinSpeed
 
 	local tp = Settings.Checks.Teleport
-	CONFIG.teleportEnabled = tp.Enabled
-	CONFIG.teleportVlThreshold = tp.VLThreshold
-	CONFIG.teleportRequiredStreak = tp.RequiredStreak
-	CONFIG.teleportEmitCooldown = tp.EmitCooldown
-	CONFIG.teleportHorizMultiplier = tp.HorizMultiplier
-	CONFIG.teleportPingAllowance = tp.PingAllowance
-	CONFIG.teleportMinDistance = tp.MinDistance
-	CONFIG.teleportUpMultiplier = tp.UpMultiplier
-	CONFIG.teleportTerminalVelocity = tp.TerminalVelocity
-	CONFIG.teleportDownMultiplier = tp.DownMultiplier
+	flat.teleportEnabled = tp.Enabled
+	flat.teleportVlThreshold = tp.VLThreshold
+	flat.teleportRequiredStreak = tp.RequiredStreak
+	flat.teleportEmitCooldown = tp.EmitCooldown
+	flat.teleportHorizMultiplier = tp.HorizMultiplier
+	flat.teleportPingAllowance = tp.PingAllowance
+	flat.teleportMinDistance = tp.MinDistance
+	flat.teleportUpMultiplier = tp.UpMultiplier
+	flat.teleportTerminalVelocity = tp.TerminalVelocity
+	flat.teleportDownMultiplier = tp.DownMultiplier
 end
 
 -- New checks use a table-driven publisher: every scalar field becomes
@@ -455,53 +479,62 @@ local PUBLISH = {
 }
 
 local function publishConfig()
-	CONFIG.paused = not Settings.Enabled
-	CONFIG.debug = Settings.Debug
-	CONFIG.gravity = Workspace.Gravity
-	CONFIG.scanInterval = Settings.ScanInterval
+	local flat = {}
 
-	CONFIG.graceSpawn = Settings.Grace.AfterSpawn
-	CONFIG.graceTeleport = Settings.Grace.AfterTeleport
-	CONFIG.graceSetback = Settings.Grace.AfterSetback
-	CONFIG.graceSeat = Settings.Grace.AfterSeat
+	flat.paused = not Settings.Enabled
+	flat.debug = Settings.Debug
+	flat.gravity = Workspace.Gravity
+	flat.scanInterval = Settings.ScanInterval
 
-	CONFIG.vlDecay = Settings.VL.DecayPerSecond
-	CONFIG.vlMax = Settings.VL.MaxDisplay
-	CONFIG.setbackEnabled = Settings.Setback.Enabled
-	CONFIG.setbackCooldown = Settings.Setback.Cooldown
-	CONFIG.kickAfterSetbacks = Settings.Punish.KickAfterSetbacks
+	flat.graceSpawn = Settings.Grace.AfterSpawn
+	flat.graceTeleport = Settings.Grace.AfterTeleport
+	flat.graceSetback = Settings.Grace.AfterSetback
+	flat.graceSeat = Settings.Grace.AfterSeat
 
-	publishLegacy()
+	flat.vlDecay = Settings.VL.DecayPerSecond
+	flat.vlMax = Settings.VL.MaxDisplay
+	flat.setbackEnabled = Settings.Setback.Enabled
+	flat.setbackCooldown = Settings.Setback.Cooldown
+	flat.kickAfterSetbacks = Settings.Punish.KickAfterSetbacks
+
+	fillLegacy(flat)
 
 	for _, spec in ipairs(PUBLISH) do
 		local c = Settings.Checks[spec.name]
 		if c ~= nil then
 			for _, f in ipairs(spec.fields) do
-				CONFIG[spec.prefix .. f] = c[f]
+				flat[spec.prefix .. f] = c[f]
 			end
 		end
 	end
 
-	-- String / list configs
-	CONFIG.physicsIgnoreNames = Settings.Checks.Physics.IgnoreNames
-	CONFIG.exploitPatterns = Settings.Checks.Exploit.Patterns
+	-- Combat / sensor queue names (read by the combat checks at require time).
+	flat.hitsName = "NanoAC_Hits"
+	flat.knocksName = "NanoAC_Knockbacks"
+	flat.hitguardName = "NanoAC_HitGuard"
+	flat.shotsName = "NanoAC_Shots"
+	flat.healsName = "NanoAC_Heals"
+
+	-- String / list configs: the raw strings are kept and the parsed arrays are
+	-- published alongside them so cfgList() never parses on the check side (fix 3).
+	flat.physicsIgnoreNames = Settings.Checks.Physics.IgnoreNames
+	flat.exploitPatterns = Settings.Checks.Exploit.Patterns
+	flat.physicsIgnoreNamesList = SharedTable.new(parseCsvList(Settings.Checks.Physics.IgnoreNames))
+	flat.exploitPatternsList = SharedTable.new(parseCsvList(Settings.Checks.Exploit.Patterns))
 
 	-- BanManager
 	local bm = Settings.BanManager
-	CONFIG.banEnabled = bm.Enabled
-	CONFIG.banKickEnabled = bm.KickEnabled
-	CONFIG.banWarnAt = bm.WarnAt
-	CONFIG.banKickAt = bm.KickAt
-	CONFIG.banDecay = bm.StrikeDecayPerSecond
+	flat.banEnabled = bm.Enabled
+	flat.banKickEnabled = bm.KickEnabled
+	flat.banWarnAt = bm.WarnAt
+	flat.banKickAt = bm.KickAt
+	flat.banDecay = bm.StrikeDecayPerSecond
 
-	-- Config generation: checks cache a local snapshot and rebuild it only when this
-	-- changes, so every read afterwards is a plain Luau table lookup.
+	-- Single batched publish (perf fix 4): the whole flat config becomes one nested
+	-- SharedTable assigned with a single CONFIG write; the revision then signals the
+	-- checks to refresh their local snapshot.
+	CONFIG.snapshot = SharedTable.new(flat)
 	CONFIG.revision = (CONFIG.revision or 0) + 1
-	-- Roster generation: bumped on join/leave so runCheck knows when its cached roster
-	-- array is stale (one shared read per tick instead of a full SharedTable iteration).
-	if CONFIG.rosterGen == nil then
-		CONFIG.rosterGen = 0
-	end
 end
 
 publishConfig()
@@ -513,9 +546,22 @@ local function now()
 	return Workspace:GetServerTimeNow()
 end
 
--- Invalidate the checks' cached roster arrays. Called on join/leave only.
-local function bumpRosterGen()
-	CONFIG.rosterGen = (CONFIG.rosterGen or 0) + 1
+-- Roster-event log (perf fix 2). Appends one add/remove event; runCheck applies these
+-- incrementally instead of rebuilding its whole roster array. The log is a bounded
+-- window: a reader that falls behind it (e.g. a disabled check) does one full rebuild.
+local ROSTER_EVENT_WINDOW = Shared.ROSTER_EVENT_WINDOW
+local function pushRosterEvent(userId, add)
+	local old = SharedTable.increment(ROSTER_EVENTS, "write", 1)
+	local index = old + 1
+	ROSTER_EVENTS[index] = SharedTable.new({ userId = userId, add = add })
+	local first = ROSTER_EVENTS["first"] or 1
+	if index - first >= ROSTER_EVENT_WINDOW then
+		local newFirst = index - ROSTER_EVENT_WINDOW + 1
+		for i = first, newFirst - 1 do
+			ROSTER_EVENTS[i] = nil
+		end
+		ROSTER_EVENTS["first"] = newFirst
+	end
 end
 
 local function yawOf(root)
@@ -675,7 +721,7 @@ local function onPlayerAdded(plr)
 	rec.lastDecay = now()
 	records[plr.UserId] = rec
 	ROSTER[plr.UserId] = rec.stateTable
-	bumpRosterGen()
+	pushRosterEvent(plr.UserId, true)
 
 	if setupCommands then setupCommands(plr) end
 
@@ -703,7 +749,7 @@ end
 local function onPlayerRemoving(plr)
 	records[plr.UserId] = nil
 	ROSTER[plr.UserId] = nil
-	bumpRosterGen()
+	pushRosterEvent(plr.UserId, false)
 end
 
 -- =====================================================================================
@@ -723,15 +769,27 @@ if Settings.BanManager.Persist then
 end
 
 local sessionBans = {}   -- [userId] = expiry (server time seconds)
+local banNegCache = {}   -- [userId] = server time of the last "not banned" result
+local BAN_NEG_TTL = 60   -- seconds to trust a negative result before re-checking
 Bans = {}
 function Bans.isBanned(plr, kickFn)
 	local userId = plr.UserId
 	local expiry = sessionBans[userId]
 	if expiry == nil and banStore ~= nil then
+		-- Negative caching (perf fix 7): most players are not banned, and a DataStore
+		-- GetAsync is pure added join latency. Cache the "not banned" verdict briefly.
+		local t = now()
+		local negAt = banNegCache[userId]
+		if negAt ~= nil and (t - negAt) < BAN_NEG_TTL then
+			return false, 0
+		end
 		local ok, val = pcall(function() return banStore:GetAsync("ban_" .. userId) end)
 		if ok and type(val) == "number" then
 			expiry = val
 			sessionBans[userId] = val
+			banNegCache[userId] = nil
+		else
+			banNegCache[userId] = t
 		end
 	end
 	if expiry == nil then return false, 0 end
@@ -740,6 +798,7 @@ function Bans.isBanned(plr, kickFn)
 		if banStore ~= nil then
 			pcall(function() banStore:RemoveAsync("ban_" .. userId) end)
 		end
+		banNegCache[userId] = now()
 		return false, 0
 	end
 	if kickFn then
@@ -751,6 +810,7 @@ end
 function Bans.ban(plr, reason)
 	local expiry = now() + Settings.BanManager.BanDuration
 	sessionBans[plr.UserId] = expiry
+	banNegCache[plr.UserId] = nil
 	if banStore ~= nil then
 		pcall(function() banStore:SetAsync("ban_" .. plr.UserId, expiry) end)
 	end
@@ -889,6 +949,7 @@ banBindable.OnInvoke = function(action, subject, arg)
 		local uid = typeof(subject) == "Instance" and subject.UserId or tonumber(subject)
 		if uid then
 			sessionBans[uid] = nil
+			banNegCache[uid] = nil
 			if banStore ~= nil then pcall(function() banStore:RemoveAsync("ban_" .. uid) end) end
 			return true
 		end
@@ -922,7 +983,11 @@ notify = topLevelNotify
 setupCommands = function(plr)
 	plr.Chatted:Connect(function(message)
 		if type(message) ~= "string" then return end
-		local cmd, a1, a2, a3 = message:match("^%s*/(%S+)%s*(%S*)%s*(%S*)%s*(%S*)")
+		local text = message :: string
+		-- Cheap early-out (perf fix 5): only a leading '/' (after optional whitespace)
+		-- can start a command, so skip the 4-capture pattern for ordinary chat lines.
+		if not string.find(text, "^%s*/") then return end
+		local cmd, a1, a2, a3 = text:match("^%s*/(%S+)%s*(%S*)%s*(%S*)%s*(%S*)")
 		if cmd == nil then return end
 		cmd = cmd:lower()
 		local rec = records[plr.UserId]
@@ -1125,18 +1190,19 @@ local function handleViolation(vrec, t)
 	end
 end
 
--- The violation queue is fed from parallel checks and drained here once per frame. If the
--- checks ever outrun the drainer (a mass flag burst, a very slow frame) we must not let the
--- SharedTable grow without bound. Two guards:
+-- Violation queues are fed from parallel checks and drained here once per frame. Sharding
+-- spreads the parallel write contention (perf fix 6), so the drainer now visits each shard.
+-- If the checks ever outrun the drainer (a mass flag burst, a very slow frame) we must not
+-- let a shard grow without bound. Two guards per shard:
 --   * MAX_DRAIN_PER_FRAME bounds the serial work this frame can do (keeps frame time sane);
 --   * MAX_QUEUE_BACKLOG drops the *oldest* surpluses when the backlog exceeds the cap, so
 --     memory is bounded and the freshest violations are the ones that survive.
-local MAX_DRAIN_PER_FRAME = 512
-local MAX_QUEUE_BACKLOG = 4096
+local MAX_DRAIN_PER_FRAME = 128   -- per shard; total per frame is SHARDS * this
+local MAX_QUEUE_BACKLOG = 1024    -- per shard; total retained is bounded by SHARDS * this
 
-local function drainQueue(t)
-	local write = QUEUE["write"]
-	local read = QUEUE["read"]
+local function drainShard(queue, t)
+	local write = queue["write"]
+	local read = queue["read"]
 	if write <= read then return end
 
 	-- Enforce the backlog cap before doing any work.
@@ -1145,10 +1211,10 @@ local function drainQueue(t)
 		local drop = backlog - MAX_QUEUE_BACKLOG
 		local stop = read + drop
 		for i = read + 1, stop do
-			QUEUE[i] = nil
+			queue[i] = nil
 		end
 		read = stop
-		QUEUE["read"] = read
+		queue["read"] = read
 		if Settings.Debug then
 			warn(string.format("[NanoAC-R] violation queue overrun: dropped %d oldest", drop))
 		end
@@ -1159,16 +1225,22 @@ local function drainQueue(t)
 		target = read + MAX_DRAIN_PER_FRAME
 	end
 	for i = read + 1, target do
-		local vrec = QUEUE[i]
+		local vrec = queue[i]
 		if vrec ~= nil then
 			local ok, err = pcall(handleViolation, vrec, t)
 			if not ok then
 				warn("[NanoAC-R] violation handling error: " .. tostring(err))
 			end
 		end
-		QUEUE[i] = nil
+		queue[i] = nil
 	end
-	QUEUE["read"] = target
+	queue["read"] = target
+end
+
+local function drainQueue(t)
+	for i = 1, QUEUE_SHARDS do
+		drainShard(QUEUES[i], t)
+	end
 end
 
 -- =====================================================================================
@@ -1370,11 +1442,34 @@ local function sample(rec, t)
 	st.time = t
 	st.dt = dt
 	st.ping = plr:GetNetworkPing()
-	st.walkSpeed = hum.WalkSpeed
-	st.jumpPower = hum.JumpPower
-	st.jumpHeight = hum.JumpHeight
-	st.maxSlopeAngle = hum.MaxSlopeAngle
-	st.hipHeight = hum.HipHeight
+	--[[
+		Dirty-checked republish (perf fix 8).
+
+		These fields change rarely, so each is compared against a plain-Lua cache on the
+		record and only written to the SharedTable when it actually changed. That removes
+		most of the per-player, per-frame SharedTable lock acquisitions without splitting
+		the state (the schema and every check's `state.<field>` access are unchanged).
+	]]
+	if hum.WalkSpeed ~= rec.lastWalkSpeed then
+		rec.lastWalkSpeed = hum.WalkSpeed
+		st.walkSpeed = hum.WalkSpeed
+	end
+	if hum.JumpPower ~= rec.lastJumpPower then
+		rec.lastJumpPower = hum.JumpPower
+		st.jumpPower = hum.JumpPower
+	end
+	if hum.JumpHeight ~= rec.lastJumpHeight then
+		rec.lastJumpHeight = hum.JumpHeight
+		st.jumpHeight = hum.JumpHeight
+	end
+	if hum.MaxSlopeAngle ~= rec.lastMaxSlopeAngle then
+		rec.lastMaxSlopeAngle = hum.MaxSlopeAngle
+		st.maxSlopeAngle = hum.MaxSlopeAngle
+	end
+	if hum.HipHeight ~= rec.lastHipHeight then
+		rec.lastHipHeight = hum.HipHeight
+		st.hipHeight = hum.HipHeight
+	end
 	st.grounded = grounded
 	st.vy = vy
 	st.pvy = pvy
@@ -1404,19 +1499,59 @@ local function sample(rec, t)
 	st.setbackCount = rec.setbacks
 
 	-- Extended state -------------------------------------------------------------
-	st.health = hum.Health
-	st.maxHealth = hum.MaxHealth
+	local health = hum.Health
+	if health ~= rec.lastHealth then
+		rec.lastHealth = health
+		st.health = health
+	end
+	local maxHealth = hum.MaxHealth
+	if maxHealth ~= rec.lastMaxHealth then
+		rec.lastMaxHealth = maxHealth
+		st.maxHealth = maxHealth
+	end
 	st.vel = vel
 	st.angVel = angVel
 	st.angSpeed = angVel.Magnitude
-	st.platformStand = hum.PlatformStand
-	st.flying = hstate == Enum.HumanoidStateType.Flying
-	st.flyingEnabled = hum:GetStateEnabled(Enum.HumanoidStateType.Flying)
-	st.deadDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Dead)
-	st.freefallDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Freefall)
-	st.strafingNoPhysics = hstate == Enum.HumanoidStateType.StrafingNoPhysics
-	st.sitNoSeat = (hum.Sit == true) and (hum.SeatPart == nil)
-	st.swimInAir = (hstate == Enum.HumanoidStateType.Swimming) and (hum.FloorMaterial ~= Enum.Material.Water)
+	local platformStand = hum.PlatformStand
+	if platformStand ~= rec.lastPlatformStand then
+		rec.lastPlatformStand = platformStand
+		st.platformStand = platformStand
+	end
+	local flying = hstate == Enum.HumanoidStateType.Flying
+	if flying ~= rec.lastFlying then
+		rec.lastFlying = flying
+		st.flying = flying
+	end
+	local flyingEnabled = hum:GetStateEnabled(Enum.HumanoidStateType.Flying)
+	if flyingEnabled ~= rec.lastFlyingEnabled then
+		rec.lastFlyingEnabled = flyingEnabled
+		st.flyingEnabled = flyingEnabled
+	end
+	local deadDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Dead)
+	if deadDisabled ~= rec.lastDeadDisabled then
+		rec.lastDeadDisabled = deadDisabled
+		st.deadDisabled = deadDisabled
+	end
+	local freefallDisabled = not hum:GetStateEnabled(Enum.HumanoidStateType.Freefall)
+	if freefallDisabled ~= rec.lastFreefallDisabled then
+		rec.lastFreefallDisabled = freefallDisabled
+		st.freefallDisabled = freefallDisabled
+	end
+	local strafingNoPhysics = hstate == Enum.HumanoidStateType.StrafingNoPhysics
+	if strafingNoPhysics ~= rec.lastStrafingNoPhysics then
+		rec.lastStrafingNoPhysics = strafingNoPhysics
+		st.strafingNoPhysics = strafingNoPhysics
+	end
+	local sitNoSeat = (hum.Sit == true) and (hum.SeatPart == nil)
+	if sitNoSeat ~= rec.lastSitNoSeat then
+		rec.lastSitNoSeat = sitNoSeat
+		st.sitNoSeat = sitNoSeat
+	end
+	local swimInAir = (hstate == Enum.HumanoidStateType.Swimming) and (hum.FloorMaterial ~= Enum.Material.Water)
+	if swimInAir ~= rec.lastSwimInAir then
+		rec.lastSwimInAir = swimInAir
+		st.swimInAir = swimInAir
+	end
 	st.whitelisted = isWhitelisted(plr)
 	st.strikes = rec.strikes
 
@@ -1432,6 +1567,9 @@ end
 RunService.PostSimulation:Connect(function()
 	local t = now()
 
+	-- MicroProfiler labels (perf instrumentation): open the MicroProfiler in Studio to
+	-- measure the serial per-frame state publish and the violation drain under peak load.
+	debug.profilebegin("NanoAC-R sample")
 	for _, rec in pairs(records) do
 		local ok, err = pcall(sample, rec, t)
 		if not ok then
@@ -1452,8 +1590,11 @@ RunService.PostSimulation:Connect(function()
 			end
 		end
 	end
+	debug.profileend()
 
+	debug.profilebegin("NanoAC-R drainQueue")
 	local ok, err = pcall(drainQueue, t)
+	debug.profileend()
 	if not ok then
 		warn("[NanoAC-R] drain error: " .. tostring(err))
 	end
