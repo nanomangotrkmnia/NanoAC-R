@@ -1,13 +1,14 @@
 --[[
-	NanoAC-R | FlyGuard
-	Covers the PlatformStand flight vectors the FlightA-C checks deliberately exempt via the
+	NanoAC-R | Flight(E)  (PlatformStand fly/hover)
+	Covers the PlatformStand flight vectors the FlightA-D checks deliberately exempt via the
 	shared isExempt() (which skips PlatformStand):
 
 	  * PlatformStand fly / hover  -- PlatformStand is true while airborne and the body
 	                                  hovers (|vy| small) for MinAirTime, or ascends faster
 	                                  than MinAscent.
 
-	Swim-in-air is a separate mode (Flight/SwimGuard), so it is intentionally NOT handled here.
+	Swim-in-air is a separate mode (Flight/FlightF, check Flight(F)), so it is intentionally
+	NOT handled here.
 
 	Ragdoll/physics states are still skipped (PlatformStand is legitimate there). Whitelist
 	legit launchers / hover mechanics with ExemptTeleport or the whitelist attribute.
@@ -16,7 +17,7 @@
 local rootActor = script:FindFirstAncestor("NanoAC-R")
 local Shared = require(rootActor:WaitForChild("NanoShared"))
 
-local CHECK = "Fly"
+local CHECK = "Flight(E)"
 local roster = Shared.roster
 
 local hoverTime = {}   -- [userId] = seconds hovering under PlatformStand
@@ -40,12 +41,12 @@ local function process(state, userId, t)
 
 	if state.platformStand == true and state.airborne == true then
 		local vy = state.vy or 0
-		if math.abs(vy) < Shared.cfg("flyMaxDescent", 8) then
+		if math.abs(vy) < Shared.cfg("flightEMaxDescent", 8) then
 			hoverTime[userId] = (hoverTime[userId] or 0) + dt
-			if hoverTime[userId] >= Shared.cfg("flyMinAirTime", 0.6) then
+			if hoverTime[userId] >= Shared.cfg("flightEMinAirTime", 0.6) then
 				bad, detail = true, string.format("platform hover=%.2fs vy=%.1f", hoverTime[userId], vy)
 			end
-		elseif vy > Shared.cfg("flyMinAscent", 8) then
+		elseif vy > Shared.cfg("flightEMinAscent", 8) then
 			bad, detail = true, string.format("platform ascend vy=%.1f", vy)
 		else
 			hoverTime[userId] = 0
@@ -60,8 +61,8 @@ local function process(state, userId, t)
 		streak[userId] = 0
 	end
 
-	if streak[userId] >= Shared.cfg("flyRequiredStreak", 2) then
-		local cd = Shared.cfg("flyEmitCooldown", 0.4)
+	if streak[userId] >= Shared.cfg("flightERequiredStreak", 2) then
+		local cd = Shared.cfg("flightEEmitCooldown", 0.4)
 		if t - (lastEmit[userId] or -math.huge) >= cd then
 			Shared.flag(userId, CHECK, 0, detail or "fly")
 			lastEmit[userId] = t
@@ -72,7 +73,7 @@ end
 
 Shared.runCheck({
 	check = CHECK,
-	enabledKey = "flyEnabled",
+	enabledKey = "flightEEnabled",
 	process = process,
 	reset = reset,
 })

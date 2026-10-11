@@ -33,8 +33,8 @@ ServerScriptService
    ├─ Movement    (Folder)
    │  ├─ PhaseA                        (Actor) → PhaseA    (Script)  <- through-wall raycast
    │  ├─ PhaseB                        (Actor) → PhaseB    (Script)  <- collision off / NoCollisionConstraint
-   │  ├─ Speed                         (Actor) → Speed     (Script)
-   │  ├─ Movement                      (Actor) → Movement  (Script)  <- CFrame-walk / no-velocity
+   │  ├─ MovementA                     (Actor) → MovementA (Script)  <- CFrame-walk / no-velocity
+   │  ├─ MovementB                     (Actor) → MovementB (Script)  <- speed / sustained
    │  ├─ Timer                         (Actor) → Timer     (Script)  <- sustained game speed
    │  ├─ Teleport                      (Actor) → Teleport  (Script)
    │  ├─ Step                          (Actor) → Step      (Script)  <- instant step-up
@@ -44,8 +44,8 @@ ServerScriptService
    │  ├─ FlightB                       (Actor) → FlightB   (Script)  <- hover / float
    │  ├─ FlightC                       (Actor) → FlightC   (Script)  <- controlled fall
    │  ├─ FlightD                       (Actor) → FlightD   (Script)  <- air-jump / mid-air rise
-   │  ├─ Fly                           (Actor) → FlyGuard  (Script)  <- PlatformStand fly/hover
-   │  └─ Swim                          (Actor) → SwimGuard (Script)  <- swim-in-air (new mode)
+   │  ├─ FlightE                       (Actor) → FlightE  (Script)  <- PlatformStand fly/hover
+   │  └─ FlightF                       (Actor) → FlightF  (Script)  <- swim-in-air
    ├─ Player      (Folder)
    │  ├─ HumanoidGuard                 (Actor) → Script   <- WalkSpeed/Jump/Hip/Slope tamper
    │  ├─ StateGuard                    (Actor) → Script   <- Flying/StrafingNoPhysics, fake sit
@@ -136,7 +136,7 @@ Casts a ray from the last safe position to the current position and a second ray
 both hit the **same** obstacle, the thickness crossed is `len - forwardDistance - backDistance`;
 a positive thickness that is a meaningful fraction of the segment means the path went fully
 through the wall. Ignores thin/steppable, non-collidable, invisible parts, other characters and
-water; ignores corner clipping; defers to Speed/Teleport when the player moved fast enough to
+water; ignores corner clipping; defers to Movement(B)/Teleport when the player moved fast enough to
 tunnel legitimately.
 
 ### Phase(B) (collision) — `Movement/PhaseB`
@@ -145,16 +145,16 @@ HRP-parented `NoCollisionConstraint` (the modern rig's accessory `NoCollisionCon
 limbs and are ignored), or a body limb with `CanCollide == false`. This is the collision-off side
 of phasing that `Phase(A)` (which catches actually passing **through** geometry) does not see.
 
-### Speed — `Movement/Speed`
-Horizontal displacement / `dt` versus `WalkSpeed * MaxMultiplier + ping allowance`, confirmed by
-a rolling average and a consecutive-sample streak. Exempts unsupported movement states and grace
-windows.
-
-### Movement (CFrame-walk) — `Movement/Movement`
+### Movement(A) (CFrame-walk) — `Movement/MovementA`
 Compares windowed displacement against the integral of `AssemblyLinearVelocity`. A client that
 writes its CFrame directly (or suppresses velocity while noclip-drifting) moves far more than its
 real velocity explains, even if the displacement stays under the WalkSpeed baseline — so this
-catches the movement that Speed alone cannot see. Ping-scaled, streaked, exempts movement states.
+catches the movement that Movement(B) alone cannot see. Ping-scaled, streaked, exempts states.
+
+### Movement(B) (speed) — `Movement/MovementB`
+Horizontal displacement / `dt` versus `WalkSpeed * MaxMultiplier + ping allowance`, confirmed by
+a rolling average and a consecutive-sample streak. Exempts unsupported movement states and grace
+windows.
 
 ### Vertical motion — `Flight/FlightA` (up) / `FlightB` (hover) / `FlightC` (controlled fall) / `FlightD` (air-jump)
 * **Ascend**: while airborne, flags gaining altitude beyond a legitimate jump. Uses a windowed
@@ -168,13 +168,13 @@ catches the movement that Speed alone cannot see. Ping-scaled, streaked, exempts
 
 A legitimate launcher (jump pad, cannon) can be whitelisted with the `ExemptTeleport` API.
 
-### Fly — `Flight/FlyGuard`
+### Flight(E) (PlatformStand) — `Flight/FlightE`
 PlatformStand flight: flags a PlatformStand + airborne body that hovers (`|vy| < MaxDescent` for
 `MinAirTime`) or ascends faster than `MinAscent`. Ragdoll/physics states are skipped.
 
-### Swim (swim-in-air) — `Flight/SwimGuard`
-The **new flight mode**: flags the `Swimming` state while `FloorMaterial ~= Water` for
-`MinTime`. Kept separate from FlyGuard so each mode owns one concern.
+### Flight(F) (swim-in-air) — `Flight/FlightF`
+Flags the `Swimming` state while `FloorMaterial ~= Water` for `MinTime`. Kept separate from
+Flight(E) so each mode owns one concern.
 
 ### Timer (sustained game speed) — `Movement/Timer`
 Rolling window of horizontal distance vs real elapsed time; flags only when the *sustained* rate
@@ -304,7 +304,7 @@ validate from the parallel phase. Without the reporting calls the combat/rate ch
   `VL.DecayPerSecond`.
 * When a check flags and the setback cooldown has elapsed:
   1. A chat alert is sent (staff-only by default) in the exact format
-     `<username> failed <Check> VL:<times> Times` (e.g. `Builderman failed Speed VL:5 Times`).
+     `<username> failed <Check> VL:<times> Times` (e.g. `Builderman failed Movement(B) VL:5 Times`).
   2. A **setback** teleports the player to the last verified safe, supported CFrame and zeroes
      their linear and angular velocity, then arms a cooldown + grace window so setbacks cannot
      loop. By default `Setback.OnEveryFlag = true`, so **any** flag sets the player back (bounded
@@ -358,8 +358,8 @@ Tested in Studio (Play Solo) on this place:
 * Tamper tests each produced flags: Humanoid (WalkSpeed/JumpPower), Phase(B) (HRP collision),
   Hitbox (HRP/limb growth), Health (MaxHealth, heal burst; a **reported** heal is credited and
   does **not** flag), Integrity (Dead disabled, extra Humanoid), UnexpectedMove(A) (LinearVelocity),
-  State (seatless sit), Fly (PlatformStand hover + ascent), Swim (synthetic swim-in-air),
-  Fling (sustained angular velocity), Movement (CFrame-walk), Hit spam, FireRate, RemoteGuard
+  State (seatless sit), Flight(E) (PlatformStand hover + ascent), Flight(F) (synthetic swim-in-air),
+  Fling (sustained angular velocity), Movement(A) (CFrame-walk), Movement(B) (speed), Hit spam, FireRate, RemoteGuard
   (spam + oversized), ExploitGuard (suspicious name), ToolGuard (equip spam).
 * `BanManager("whitelist", player)` suppressed a subsequent tamper entirely; a single flag
   produced one setback (`setbackCount 0 -> 1`).
@@ -414,6 +414,7 @@ To install for someone: `rojo build` a place (or hand them the repo and have the
 or export the `NanoAC-R` Actor to an `.rbxmx` and drop it in `ServerScriptService`.
 
 Notes:
-- **Defaults**: `Setback.OnEveryFlag = true`, `Setback.Cooldown = 1.5`, `Grace.AfterSetback = 1.0`,
-  standard check streaks/cooldowns, `Alerts.EveryoneIsStaff = false`. Add your UserId to
+- **Defaults**: `Setback.OnEveryFlag = true`, `Setback.Cooldown = 0.5`, `Grace.AfterSetback = 0.25`,
+  tighter Movement(A)/Movement(B)/Timer streaks (they accumulate across on/off toggles instead of resetting),
+  `Alerts.EveryoneIsStaff = false`. Add your UserId to
   `Alerts.StaffUserIds` (or set the `NanoAC_Staff` attribute) to receive alerts.

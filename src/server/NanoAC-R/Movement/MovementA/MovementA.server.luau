@@ -1,11 +1,12 @@
 --[[
-	NanoAC-R | MovementGuard
+	NanoAC-R | Movement(A)  (CFrame-walk)
 	Detects "CFrame walking" / move-with-no-velocity: a client that writes its CFrame
 	directly (or suppresses velocity, e.g. anti-knockback + noclip drift) so that the
 	observed displacement over a short window is far larger than the integral of the
 	body's real AssemblyLinearVelocity.
 
-	Speed cannot catch this on its own because a CFrame-walker can keep its displacement
+	Movement(B) (the old Speed check) cannot catch this on its own because a CFrame-walker
+	can keep its displacement
 	at/under the Humanoid.WalkSpeed baseline while its velocity stays ~0. This check ties
 	displacement to actual velocity, so the mismatch is the signature.
 
@@ -16,7 +17,7 @@
 local rootActor = script:FindFirstAncestor("NanoAC-R")
 local Shared = require(rootActor:WaitForChild("NanoShared"))
 
-local CHECK = "Movement"
+local CHECK = "Movement(A)"
 local roster = Shared.roster
 
 --[[
@@ -84,8 +85,8 @@ local function process(state, userId, t)
 
 	local dt = t - tr.prevT
 	if dt <= 0.001 then return end
-	if dt > 0.5 or Shared.isExempt(state, t) then
-		-- lag spike / rebaseline, or an exempt movement state
+	if dt > 0.5 or state.airborne == true or state.jumping == true or Shared.isExempt(state, t) then
+		-- lag spike / rebaseline, an airborne/jump phase, or an exempt movement state
 		resetTrack(tr, t, pos)
 		streak[userId] = 0
 		return
@@ -130,21 +131,21 @@ local function process(state, userId, t)
 	local duration = t - tr.windowStart
 	local totalDisp, totalVel = tr.sumD, tr.sumV
 
-	local minMove = Shared.cfg("movementMinMove", 5)
-	local slack = Shared.cfg("movementVelocitySlack", 1.8)
+	local minMove = Shared.cfg("movementAMinMove", 5)
+	local slack = Shared.cfg("movementAVelocitySlack", 1.8)
 	local ping = state.ping or 0
-	local allowance = totalVel * slack + Shared.cfg("movementPingAllowance", 6) * ping
+	local allowance = totalVel * slack + Shared.cfg("movementAPingAllowance", 6) * ping
 	local filled = duration >= WINDOW * 0.8
 
 	local bad = filled and totalDisp > minMove and totalDisp > allowance
 	if bad then
 		streak[userId] = (streak[userId] or 0) + 1
 	else
-		streak[userId] = 0
+		streak[userId] = math.max(0, (streak[userId] or 0) - 0.5)
 	end
 
-	if streak[userId] >= Shared.cfg("movementRequiredStreak", 3) then
-		local cd = Shared.cfg("movementEmitCooldown", 0.4)
+	if streak[userId] >= Shared.cfg("movementARequiredStreak", 2) then
+		local cd = Shared.cfg("movementAEmitCooldown", 0.4)
 		if t - (lastEmit[userId] or -math.huge) >= cd then
 			Shared.flag(userId, CHECK, totalDisp - allowance,
 				string.format("moved=%.1f velIntegral=%.1f over %.2fs", totalDisp, totalVel, duration))
@@ -156,7 +157,7 @@ end
 
 Shared.runCheck({
 	check = CHECK,
-	enabledKey = "movementEnabled",
+	enabledKey = "movementAEnabled",
 	process = process,
 	reset = reset,
 })

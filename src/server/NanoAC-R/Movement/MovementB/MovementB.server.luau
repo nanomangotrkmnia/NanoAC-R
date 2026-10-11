@@ -1,5 +1,5 @@
 --[[
-	NanoAC-R | SpeedCheck
+	NanoAC-R | Movement(B)  (speed)
 	Runs fully in the parallel phase (ConnectParallel). Reads the shared per-player state
 	from the Coordinator and flags sustained horizontal speeds above the server-predicted
 	maximum (Humanoid.WalkSpeed + ping/elapsed-time allowance). It never touches the
@@ -14,7 +14,7 @@ local RunService = game:GetService("RunService")
 local rootActor = script:FindFirstAncestor("NanoAC-R")
 local Shared = require(rootActor:WaitForChild("NanoShared"))
 
-local CHECK = "Speed"
+local CHECK = "Movement(B)"
 local roster = Shared.roster
 
 local prev = {}      -- [userId] = { pos = Vector3, time = number }
@@ -61,10 +61,10 @@ local function process(state, userId, t)
 
 	local walk = state.walkSpeed or 16
 	local ping = state.ping or 0
-	local allowed = walk * Shared.cfg("speedMaxMultiplier", 1.4)
-		+ Shared.cfg("speedPingAllowance", 8) * ping
-	local cap = Shared.cfg("speedAbsoluteCap", 200)
-	local minSpeed = Shared.cfg("speedMinSpeed", 26)
+	local allowed = walk * Shared.cfg("movementBMaxMultiplier", 1.4)
+		+ Shared.cfg("movementBPingAllowance", 8) * ping
+	local cap = Shared.cfg("movementBAbsoluteCap", 200)
+	local minSpeed = Shared.cfg("movementBMinSpeed", 26)
 
 	-- rolling average over the last N samples
 	local win = windows[userId]
@@ -74,7 +74,7 @@ local function process(state, userId, t)
 	end
 	table.insert(win.data, speed)
 	win.sum += speed
-	local maxN = Shared.cfg("speedWindow", 10)
+	local maxN = Shared.cfg("movementBWindow", 10)
 	while #win.data > maxN do
 		win.sum -= table.remove(win.data, 1)
 	end
@@ -86,11 +86,11 @@ local function process(state, userId, t)
 	if violating then
 		streak[userId] = (streak[userId] or 0) + 1
 	else
-		streak[userId] = 0
+		streak[userId] = math.max(0, (streak[userId] or 0) - 0.5)
 	end
 
-	if streak[userId] >= Shared.cfg("speedRequiredStreak", 6) then
-		local cd = Shared.cfg("speedEmitCooldown", 0.6)
+	if streak[userId] >= Shared.cfg("movementBRequiredStreak", 3) then
+		local cd = Shared.cfg("movementBEmitCooldown", 0.6)
 		if t - (lastEmit[userId] or -math.huge) >= cd then
 			Shared.flag(userId, CHECK, speed - allowed,
 				string.format("speed=%.1f avg=%.1f allowed=%.1f", speed, avg, allowed))
@@ -103,7 +103,7 @@ end
 RunService.PreSimulation:ConnectParallel(function()
 	if disabled then return end
 	if Shared.cfg("paused", false) then return end
-	if Shared.cfg("speedEnabled", true) == false then return end
+	if Shared.cfg("movementBEnabled", true) == false then return end
 
 	local ok, err = pcall(function()
 		for userId, state in roster do
@@ -121,12 +121,12 @@ RunService.PreSimulation:ConnectParallel(function()
 	if not ok then
 		errors += 1
 		if os.clock() - lastErrLog > 5 then
-			warn("[NanoAC-R] Speed error: " .. tostring(err))
+			warn("[NanoAC-R] Movement(B) error: " .. tostring(err))
 			lastErrLog = os.clock()
 		end
 		if errors >= 10 then
 			disabled = true
-			warn("[NanoAC-R] Speed check disabled after repeated errors.")
+			warn("[NanoAC-R] Movement(B) check disabled after repeated errors.")
 		end
 	end
 end)

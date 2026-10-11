@@ -21,8 +21,8 @@
 	    ├─ NanoShared (ModuleScript)
 	    ├─ ExemptTeleport / ReportHit / ReportKnockback / ReportShot / ReportHeal / BanManager
 	    ├─ Core/           Coordinator (this file)
-	    ├─ Movement/       { PhaseA, PhaseB, Speed, Timer, Teleport, Step, Spider, Movement }
-	    ├─ Flight/         { FlightA, FlightB, FlightC, FlightD, Fly }
+	    ├─ Movement/       { PhaseA, PhaseB, MovementA, MovementB, Timer, Teleport, Step, Spider }
+	    ├─ Flight/         { FlightA, FlightB, FlightC, FlightD, FlightE, FlightF }
 	    ├─ Player/         { HumanoidGuard, StateGuard, IntegrityGuard,
 	    │                     UnexpectedMoveA, HealthGuard, HitboxGuard }
 	    ├─ Combat/         { ThroughWall, Velocity, Hit, Fling, FireRate }
@@ -106,7 +106,7 @@ local Settings = {
 	Grace = {
 		AfterSpawn = 4,            -- after character load / respawn
 		AfterTeleport = 1.5,       -- after a whitelisted teleport
-		AfterSetback = 1.0,        -- after we ourselves set the player back
+		AfterSetback = 0.25,       -- after we ourselves set the player back
 		AfterSeat = 0.5,           -- after entering / leaving a seat
 	},
 
@@ -119,7 +119,7 @@ local Settings = {
 	-- Setback behaviour ---------------------------------------------------------------
 	Setback = {
 		Enabled = true,
-		Cooldown = 1.5,            -- seconds between setbacks for a single player
+		Cooldown = 0.5,            -- seconds between setbacks for a single player
 		OnEveryFlag = true,        -- set back on ANY flag, not only threshold crossings
 		FreezeSafeSpotOnFlag = true, -- don't advance the safe spot while a player is flagged
 	},
@@ -159,9 +159,9 @@ local Settings = {
 			MaxSegment = 60,           -- ignore paths longer than this (unreliable)
 			SpeedFactor = 1.6,         -- if moving faster than walk*this, defer to Speed/Teleport
 		},
-		Speed = {
-			Enabled = true, VLThreshold = 10, RequiredStreak = 6, EmitCooldown = 0.6,
-			MaxMultiplier = 1.4,       -- allowed multiple of Humanoid.WalkSpeed
+		["Movement(B)"] = {
+			Enabled = true, VLThreshold = 10, RequiredStreak = 3, EmitCooldown = 0.6,
+			MaxMultiplier = 1.3,       -- allowed multiple of Humanoid.WalkSpeed
 			PingAllowance = 8,         -- extra studs/s of tolerance per second of ping
 			AbsoluteCap = 200,         -- never tolerate speeds above this
 			MinSpeed = 26,             -- don't bother below this (studs/s)
@@ -214,9 +214,9 @@ local Settings = {
 			Room = 3.5,                -- skip if a wall sits this close in the knockback direction
 		},
 		Timer = {
-			Enabled = true, VLThreshold = 8, RequiredStreak = 3, EmitCooldown = 1.0,
+			Enabled = true, VLThreshold = 8, RequiredStreak = 2, EmitCooldown = 1.0,
 			Window = 1.5,              -- rolling window (seconds)
-			AllowedRatio = 1.12,       -- sustained speed may not exceed walk*ratio
+			AllowedRatio = 1.08,       -- sustained speed may not exceed walk*ratio
 			MinSamples = 20,           -- need this many samples in the window first
 			MinSpeed = 20,             -- ignore slow movement entirely
 		},
@@ -231,10 +231,10 @@ local Settings = {
 		},
 
 		-- NEW GUARDS ------------------------------------------------------------------
-		Movement = {                  -- CFrame-walk: moved with no matching velocity
-			Enabled = true, VLThreshold = 6, RequiredStreak = 3, EmitCooldown = 0.4,
+		["Movement(A)"] = {           -- CFrame-walk: moved with no matching velocity
+			Enabled = true, VLThreshold = 6, RequiredStreak = 2, EmitCooldown = 0.4,
 			MinMove = 3.0,             -- ignore moves shorter than this (studs)
-			VelocitySlack = 1.8,       -- allowance = |vel|*dt*this + PingAllowance
+			VelocitySlack = 1.5,       -- allowance = |vel|*dt*this + PingAllowance
 			PingAllowance = 6,
 		},
 		Humanoid = {                  -- WalkSpeed / JumpPower / JumpHeight / HipHeight / MaxSlopeAngle
@@ -255,13 +255,13 @@ local Settings = {
 		["Phase(B)"] = {              -- HRP/limb collision off, NoCollisionConstraint
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
 		},
-		Fly = {                       -- PlatformStand fly/hover, illegal ascent
+		["Flight(E)"] = {             -- PlatformStand fly/hover, illegal ascent
 			Enabled = true, VLThreshold = 6, RequiredStreak = 2, EmitCooldown = 0.4,
 			MaxDescent = 8,            -- |vy| below this while platform/hovering counts as hover
 			MinAirTime = 0.6,          -- seconds before a hover/ascent flags
 			MinAscent = 8,             -- studs/s upward that is illegal without a launcher
 		},
-		Swim = {                      -- swim-in-air (own mode; separate from Fly)
+		["Flight(F)"] = {             -- swim-in-air (own mode; separate from Flight(E))
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.4,
 			MinTime = 0.4,             -- seconds swimming outside water before flagging
 		},
@@ -353,16 +353,16 @@ local function fillLegacy(flat)
 	flat.phaseASpeedFactor = p.SpeedFactor
 	flat.phaseAMaxSegment = p.MaxSegment
 
-	local s = Settings.Checks.Speed
-	flat.speedEnabled = s.Enabled
-	flat.speedVlThreshold = s.VLThreshold
-	flat.speedRequiredStreak = s.RequiredStreak
-	flat.speedEmitCooldown = s.EmitCooldown
-	flat.speedMaxMultiplier = s.MaxMultiplier
-	flat.speedPingAllowance = s.PingAllowance
-	flat.speedAbsoluteCap = s.AbsoluteCap
-	flat.speedMinSpeed = s.MinSpeed
-	flat.speedWindow = s.Window
+	local s = Settings.Checks["Movement(B)"]
+	flat.movementBEnabled = s.Enabled
+	flat.movementBVlThreshold = s.VLThreshold
+	flat.movementBRequiredStreak = s.RequiredStreak
+	flat.movementBEmitCooldown = s.EmitCooldown
+	flat.movementBMaxMultiplier = s.MaxMultiplier
+	flat.movementBPingAllowance = s.PingAllowance
+	flat.movementBAbsoluteCap = s.AbsoluteCap
+	flat.movementBMinSpeed = s.MinSpeed
+	flat.movementBWindow = s.Window
 
 	local a = Settings.Checks.FlightA
 	flat.flightAEnabled = a.Enabled
@@ -460,13 +460,13 @@ end
 -- New checks use a table-driven publisher: every scalar field becomes
 -- "<prefix><Field>" (e.g. Humanoid.Enabled -> humanoidEnabled).
 local PUBLISH = {
-	{ name = "Movement",  prefix = "movement",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinMove", "VelocitySlack", "PingAllowance" } },
+	{ name = "Movement(A)", prefix = "movementA", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinMove", "VelocitySlack", "PingAllowance" } },
 	{ name = "Humanoid",  prefix = "humanoid",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "WalkTolerance", "JumpTolerance", "JumpHeightTolerance", "HipTolerance", "SlopeTolerance" } },
 	{ name = "State",     prefix = "state",     fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "SitGrace" } },
 	{ name = "Integrity", prefix = "integrity", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
 	{ name = "Phase(B)",  prefix = "phaseB",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
-	{ name = "Fly",       prefix = "fly",       fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxDescent", "MinAirTime", "MinAscent" } },
-	{ name = "Swim",      prefix = "swim",      fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinTime" } },
+	{ name = "Flight(E)", prefix = "flightE",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxDescent", "MinAirTime", "MinAscent" } },
+	{ name = "Flight(F)", prefix = "flightF",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinTime" } },
 	{ name = "UnexpectedMove(A)", prefix = "unexpectedMoveA", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
 	{ name = "Health",    prefix = "health",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxHealthTolerance", "OverhealTolerance", "HealBurst", "HealPerSecond" } },
 	{ name = "Hitbox",    prefix = "hitbox",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "GrowthRatio", "GrowthTolerance", "AccessoryMaxSize" } },

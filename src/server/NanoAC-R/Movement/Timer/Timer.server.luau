@@ -87,10 +87,10 @@ local function process(state, userId, t)
 	if sustained > allowed and sustained > minSpeed then
 		streak[userId] = (streak[userId] or 0) + 1
 	else
-		streak[userId] = 0
+		streak[userId] = math.max(0, (streak[userId] or 0) - 0.5)
 	end
 
-	if streak[userId] >= Shared.cfg("timerRequiredStreak", 3) then
+	if streak[userId] >= Shared.cfg("timerRequiredStreak", 2) then
 		local cd = Shared.cfg("timerEmitCooldown", 1.0)
 		if t - (lastEmit[userId] or -math.huge) >= cd then
 			Shared.flag(userId, CHECK, sustained - allowed,
