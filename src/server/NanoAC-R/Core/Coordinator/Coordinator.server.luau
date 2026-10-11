@@ -21,10 +21,10 @@
 	    ├─ NanoShared (ModuleScript)
 	    ├─ ExemptTeleport / ReportHit / ReportKnockback / ReportShot / ReportHeal / BanManager
 	    ├─ Core/           Coordinator (this file)
-	    ├─ Movement/       { Phase, Speed, Timer, Teleport, Step, Spider, Movement }
+	    ├─ Movement/       { PhaseA, PhaseB, Speed, Timer, Teleport, Step, Spider, Movement }
 	    ├─ Flight/         { FlightA, FlightB, FlightC, FlightD, Fly }
-	    ├─ Player/         { HumanoidGuard, StateGuard, IntegrityGuard, NoclipGuard,
-	    │                     PhysicsGuard, HealthGuard, HitboxGuard }
+	    ├─ Player/         { HumanoidGuard, StateGuard, IntegrityGuard,
+	    │                     UnexpectedMoveA, HealthGuard, HitboxGuard }
 	    ├─ Combat/         { ThroughWall, Velocity, Hit, Fling, FireRate }
 	    └─ Network/        { RemoteGuard, ToolGuard, ExploitGuard }
 
@@ -151,7 +151,7 @@ local Settings = {
 
 	-- Per-check tuning ----------------------------------------------------------------
 	Checks = {
-		Phase = {
+		["Phase(A)"] = {
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.6,
 			MinMove = 2.5,             -- ignore segments shorter than this (studs)
 			MinPartThickness = 0.6,    -- thinner parts are steppable -> ignore
@@ -252,7 +252,7 @@ local Settings = {
 		Integrity = {                 -- disabled Dead/Freefall, enabled Flying, extra Humanoids
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
 		},
-		Noclip = {                    -- HRP/limb collision off, NoCollisionConstraint
+		["Phase(B)"] = {              -- HRP/limb collision off, NoCollisionConstraint
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.5,
 		},
 		Fly = {                       -- PlatformStand fly/hover, illegal ascent
@@ -265,7 +265,7 @@ local Settings = {
 			Enabled = true, VLThreshold = 5, RequiredStreak = 2, EmitCooldown = 0.4,
 			MinTime = 0.4,             -- seconds swimming outside water before flagging
 		},
-		Physics = {                   -- injected movers / constraints / LineForce
+		["UnexpectedMove(A)"] = {     -- injected movers / constraints / LineForce
 			Enabled = true, VLThreshold = 4, RequiredStreak = 1, EmitCooldown = 0.5,
 			IgnoreNames = "NanoAC_Legit,NanoAC_FlyAtt,NanoAC_Fly", -- comma list or attribute
 		},
@@ -342,16 +342,16 @@ end
 -- Legacy checks are filled into the flat config table supplied by publishConfig, so the
 -- whole config is written to the SharedTable in a single batched operation (perf fix 4).
 local function fillLegacy(flat)
-	local p = Settings.Checks.Phase
-	flat.phaseEnabled = p.Enabled
-	flat.phaseVlThreshold = p.VLThreshold
-	flat.phaseRequiredStreak = p.RequiredStreak
-	flat.phaseEmitCooldown = p.EmitCooldown
-	flat.phaseMinMove = p.MinMove
-	flat.phaseMinPartThickness = p.MinPartThickness
-	flat.phaseMaxTransparency = p.MaxTransparency
-	flat.phaseSpeedFactor = p.SpeedFactor
-	flat.phaseMaxSegment = p.MaxSegment
+	local p = Settings.Checks["Phase(A)"]
+	flat.phaseAEnabled = p.Enabled
+	flat.phaseAVlThreshold = p.VLThreshold
+	flat.phaseARequiredStreak = p.RequiredStreak
+	flat.phaseAEmitCooldown = p.EmitCooldown
+	flat.phaseAMinMove = p.MinMove
+	flat.phaseAMinPartThickness = p.MinPartThickness
+	flat.phaseAMaxTransparency = p.MaxTransparency
+	flat.phaseASpeedFactor = p.SpeedFactor
+	flat.phaseAMaxSegment = p.MaxSegment
 
 	local s = Settings.Checks.Speed
 	flat.speedEnabled = s.Enabled
@@ -464,10 +464,10 @@ local PUBLISH = {
 	{ name = "Humanoid",  prefix = "humanoid",  fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "WalkTolerance", "JumpTolerance", "JumpHeightTolerance", "HipTolerance", "SlopeTolerance" } },
 	{ name = "State",     prefix = "state",     fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "SitGrace" } },
 	{ name = "Integrity", prefix = "integrity", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
-	{ name = "Noclip",    prefix = "noclip",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+	{ name = "Phase(B)",  prefix = "phaseB",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
 	{ name = "Fly",       prefix = "fly",       fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxDescent", "MinAirTime", "MinAscent" } },
 	{ name = "Swim",      prefix = "swim",      fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MinTime" } },
-	{ name = "Physics",   prefix = "physics",   fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
+	{ name = "UnexpectedMove(A)", prefix = "unexpectedMoveA", fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown" } },
 	{ name = "Health",    prefix = "health",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxHealthTolerance", "OverhealTolerance", "HealBurst", "HealPerSecond" } },
 	{ name = "Hitbox",    prefix = "hitbox",    fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "GrowthRatio", "GrowthTolerance", "AccessoryMaxSize" } },
 	{ name = "Fling",     prefix = "fling",     fields = { "Enabled", "VLThreshold", "RequiredStreak", "EmitCooldown", "MaxAngular", "MaxSpeed" } },
@@ -517,9 +517,9 @@ local function publishConfig()
 
 	-- String / list configs: the raw strings are kept and the parsed arrays are
 	-- published alongside them so cfgList() never parses on the check side (fix 3).
-	flat.physicsIgnoreNames = Settings.Checks.Physics.IgnoreNames
+	flat.unexpectedMoveAIgnoreNames = Settings.Checks["UnexpectedMove(A)"].IgnoreNames
 	flat.exploitPatterns = Settings.Checks.Exploit.Patterns
-	flat.physicsIgnoreNamesList = SharedTable.new(parseCsvList(Settings.Checks.Physics.IgnoreNames))
+	flat.unexpectedMoveAIgnoreNamesList = SharedTable.new(parseCsvList(Settings.Checks["UnexpectedMove(A)"].IgnoreNames))
 	flat.exploitPatternsList = SharedTable.new(parseCsvList(Settings.Checks.Exploit.Patterns))
 
 	-- BanManager
@@ -1301,7 +1301,7 @@ local function scanCharacter(rec, char, hum)
 	end
 
 	local noCollision, physCount, humanoidCount = 0, 0, 0
-	local ignore = Settings.Checks.Physics.IgnoreNames
+	local ignore = Settings.Checks["UnexpectedMove(A)"].IgnoreNames
 	local function ignored(inst)
 		if inst:GetAttribute("NanoAC_Legit") == true then return true end
 		if ignore ~= "" and string.find(ignore, inst.Name, 1, true) then return true end

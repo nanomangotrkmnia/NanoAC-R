@@ -274,7 +274,7 @@ end
 
 -- Stricter variant that ignores the *movement* exemptions (swim/climb/seat/platform)
 -- but still honours death, whitelist and grace windows. Used by the property/state
--- guards (HumanoidGuard, StateGuard, NoclipGuard, PhysicsGuard, ...) which must still
+-- guards (HumanoidGuard, StateGuard, Phase(B), UnexpectedMove(A), ...) which must still
 -- run while a player is seated/swimming. Aggregated as state.exemptGrace (see above).
 function NanoShared.isGrace(state, now)
 	if state == nil then return true end

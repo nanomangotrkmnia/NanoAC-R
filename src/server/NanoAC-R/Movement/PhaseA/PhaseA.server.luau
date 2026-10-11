@@ -1,6 +1,7 @@
 --[[
-	NanoAC-R | PhaseCheck  (NoClip)
+	NanoAC-R | Phase(A)  (through-wall raycast)
 	Detects a player whose movement path passes FULLY through a solid, collidable wall.
+	(The collision-off variant of the Phase family lives in Movement/PhaseB as Phase(B).)
 
 	The ray runs from the player's LAST VALID (safe, supported) position to their current
 	position, exactly as the design calls for. Because that origin freezes while a player is
@@ -29,7 +30,7 @@ local Players = game:GetService("Players")
 local rootActor = script:FindFirstAncestor("NanoAC-R")
 local Shared = require(rootActor:WaitForChild("NanoShared"))
 
-local CHECK = "Phase"
+local CHECK = "Phase(A)"
 local roster = Shared.roster
 
 local streak = {}    -- [userId] = number
@@ -77,8 +78,8 @@ local function evaluate(job)
 	local len = delta.Magnitude
 	if len < 1e-3 then return end
 
-	local maxTrans = Shared.cfg("phaseMaxTransparency", 0.9)
-	local minThick = Shared.cfg("phaseMinPartThickness", 0.6)
+	local maxTrans = Shared.cfg("phaseAMaxTransparency", 0.9)
+	local minThick = Shared.cfg("phaseAMinPartThickness", 0.6)
 
 	local fwd = Workspace:Raycast(from, delta, params)
 	if fwd == nil then return end
@@ -95,8 +96,8 @@ local function evaluate(job)
 
 	local userId = job.userId
 	streak[userId] = (streak[userId] or 0) + 1
-	if streak[userId] >= Shared.cfg("phaseRequiredStreak", 2) then
-		local cd = Shared.cfg("phaseEmitCooldown", 0.6)
+	if streak[userId] >= Shared.cfg("phaseARequiredStreak", 2) then
+		local cd = Shared.cfg("phaseAEmitCooldown", 0.6)
 		if job.now - (lastEmit[userId] or -math.huge) >= cd then
 			Shared.flag(userId, CHECK, thickness,
 				string.format("through %s (%.2f studs)", fwd.Instance.Name, thickness))
@@ -109,15 +110,15 @@ end
 RunService.PreSimulation:Connect(function()
 	if disabled then return end
 	if Shared.cfg("paused", false) then return end
-	if Shared.cfg("phaseEnabled", true) == false then return end
+	if Shared.cfg("phaseAEnabled", true) == false then return end
 
 	local jobs = {}
 
 	-- ---------------------------- SERIAL -------------------------------------------------
 	local ok, err = pcall(function()
-		local minMove = Shared.cfg("phaseMinMove", 2.5)
-		local maxSeg = Shared.cfg("phaseMaxSegment", 60)
-		local factor = Shared.cfg("phaseSpeedFactor", 1.6)
+		local minMove = Shared.cfg("phaseAMinMove", 2.5)
+		local maxSeg = Shared.cfg("phaseAMaxSegment", 60)
+		local factor = Shared.cfg("phaseASpeedFactor", 1.6)
 		for _, plr in ipairs(Players:GetPlayers()) do
 			local userId = plr.UserId
 			local state = roster[userId]
@@ -157,7 +158,7 @@ RunService.PreSimulation:Connect(function()
 
 	if not ok then
 		if os.clock() - lastErrLog > 5 then
-			warn("[NanoAC-R] Phase gather error: " .. tostring(err))
+			warn("[NanoAC-R] Phase(A) gather error: " .. tostring(err))
 			lastErrLog = os.clock()
 		end
 		return
@@ -177,12 +178,12 @@ RunService.PreSimulation:Connect(function()
 	if not ok2 then
 		errors += 1
 		if os.clock() - lastErrLog > 5 then
-			warn("[NanoAC-R] Phase error: " .. tostring(err2))
+			warn("[NanoAC-R] Phase(A) error: " .. tostring(err2))
 			lastErrLog = os.clock()
 		end
 		if errors >= 10 then
 			disabled = true
-			warn("[NanoAC-R] Phase check disabled after repeated errors.")
+			warn("[NanoAC-R] Phase(A) check disabled after repeated errors.")
 		end
 	end
 end)

@@ -31,7 +31,8 @@ ServerScriptService
    ├─ Core        (Folder)
    │  └─ Coordinator                   (Actor) → Coordinator (Script)  <- serial (the only DM writer)
    ├─ Movement    (Folder)
-   │  ├─ Phase                         (Actor) → Phase     (Script)  <- NoClip / phasing
+   │  ├─ PhaseA                        (Actor) → PhaseA    (Script)  <- through-wall raycast
+   │  ├─ PhaseB                        (Actor) → PhaseB    (Script)  <- collision off / NoCollisionConstraint
    │  ├─ Speed                         (Actor) → Speed     (Script)
    │  ├─ Movement                      (Actor) → Movement  (Script)  <- CFrame-walk / no-velocity
    │  ├─ Timer                         (Actor) → Timer     (Script)  <- sustained game speed
@@ -49,8 +50,7 @@ ServerScriptService
    │  ├─ HumanoidGuard                 (Actor) → Script   <- WalkSpeed/Jump/Hip/Slope tamper
    │  ├─ StateGuard                    (Actor) → Script   <- Flying/StrafingNoPhysics, fake sit
    │  ├─ IntegrityGuard                (Actor) → Script   <- Dead/Freefall disabled, extra Humanoids
-   │  ├─ NoclipGuard                   (Actor) → Script   <- HRP collision off / NoCollisionConstraint
-   │  ├─ PhysicsGuard                  (Actor) → Script   <- injected movers / forces
+   │  ├─ UnexpectedMoveA               (Actor) → Script   <- injected movers / forces
    │  ├─ HealthGuard                   (Actor) → Script   <- MaxHealth tamper / heal bursts
    │  └─ HitboxGuard                   (Actor) → Script   <- inflated limbs / accessories
    ├─ Combat      (Folder)
@@ -95,7 +95,7 @@ shared roster/config and pushes to the shared queue (see `NanoShared.runCheck`).
 * `NanoShared` (the module) is required in a **serial** context so it can cache service handles;
   its functions only touch `SharedTable`s / pure values, so they are safe to call in parallel.
 * Pure-data checks use `RunService.PreSimulation:ConnectParallel` (usually via
-  `NanoShared.runCheck`). `Phase` and `Spider` use `PreSimulation:Connect` + `task.desynchronize()`
+  `NanoShared.runCheck`). `Phase(A)` and `Spider` use `PreSimulation:Connect` + `task.desynchronize()`
   because building a `RaycastParams` exclusion list is not allowed in parallel.
 * Every check wraps its tick in `pcall`. On error it logs (throttled) and, after 10 errors,
   disables **only itself** — every other check keeps running.
@@ -131,13 +131,19 @@ queue's `write`/`read` to `0` at load, and drains them each frame.
 
 ## 3. Movement & flight checks
 
-### Phase (NoClip) — `Movement/Phase`
+### Phase(A) (through-wall) — `Movement/PhaseA`
 Casts a ray from the last safe position to the current position and a second ray backwards. When
 both hit the **same** obstacle, the thickness crossed is `len - forwardDistance - backDistance`;
 a positive thickness that is a meaningful fraction of the segment means the path went fully
 through the wall. Ignores thin/steppable, non-collidable, invisible parts, other characters and
 water; ignores corner clipping; defers to Speed/Teleport when the player moved fast enough to
 tunnel legitimately.
+
+### Phase(B) (collision) — `Movement/PhaseB`
+Flags a character whose collision has been removed: `HumanoidRootPart.CanCollide == false`, an
+HRP-parented `NoCollisionConstraint` (the modern rig's accessory `NoCollisionConstraint`s live on
+limbs and are ignored), or a body limb with `CanCollide == false`. This is the collision-off side
+of phasing that `Phase(A)` (which catches actually passing **through** geometry) does not see.
 
 ### Speed — `Movement/Speed`
 Horizontal displacement / `dt` versus `WalkSpeed * MaxMultiplier + ping allowance`, confirmed by
@@ -206,15 +212,11 @@ persisted `SitGrace`).
 Flags Dead/Freefall state disabled, Flying enabled (both **baseline-relative**, so engine defaults
 never false-flag) and extra Humanoids in the character.
 
-### NoclipGuard — `Player/NoclipGuard`
-Flags `HumanoidRootPart.CanCollide == false` and an HRP-parented `NoCollisionConstraint`. (The
-modern rig's accessory `NoCollisionConstraint`s live on limbs and are ignored; phasing is Phase.)
-
-### PhysicsGuard — `Player/PhysicsGuard`
+### UnexpectedMove(A) — `Player/UnexpectedMoveA`
 Flags injected body movers / forces / constraints (`BodyVelocity`, `LinearVelocity`,
 `VectorForce`, `LineForce`, ...). The R15 rig's `BallSocketConstraint` / `AnimationConstraint` /
 `RigidConstraint` joints are excluded. Tag legitimate instances with `NanoAC_Legit` or add the
-name to `Checks.Physics.IgnoreNames`.
+name to `Checks["UnexpectedMove(A)"].IgnoreNames`.
 
 ### HealthGuard — `Player/HealthGuard`
 Flags MaxHealth changed from baseline, Health above MaxHealth, and illegal heal bursts (a
@@ -325,7 +327,7 @@ to everyone in chat.
 
 All tuning lives in the `Settings` table at the top of `Coordinator.Coordinator`. It is the
 single source of truth; the Coordinator mirrors every scalar value into the `NanoAC_Config`
-SharedTable (and string lists such as `Exploit.Patterns` / `Physics.IgnoreNames`), which the
+SharedTable (and string lists such as `Exploit.Patterns` / `UnexpectedMove(A).IgnoreNames`), which the
 checks read from parallel threads.
 
 | Section | What it controls |
@@ -353,9 +355,9 @@ Tested in Studio (Play Solo) on this place:
   queue each frame — no `[NanoAC-R] ... error` lines.
 * Idle at spawn and real engine-driven **walking + jumping produced zero** flags
   (`queue.write` stayed at 0/40 while the character moved ~126 studs).
-* Tamper tests each produced flags: Humanoid (WalkSpeed/JumpPower), Noclip (HRP collision),
+* Tamper tests each produced flags: Humanoid (WalkSpeed/JumpPower), Phase(B) (HRP collision),
   Hitbox (HRP/limb growth), Health (MaxHealth, heal burst; a **reported** heal is credited and
-  does **not** flag), Integrity (Dead disabled, extra Humanoid), Physics (LinearVelocity),
+  does **not** flag), Integrity (Dead disabled, extra Humanoid), UnexpectedMove(A) (LinearVelocity),
   State (seatless sit), Fly (PlatformStand hover + ascent), Swim (synthetic swim-in-air),
   Fling (sustained angular velocity), Movement (CFrame-walk), Hit spam, FireRate, RemoteGuard
   (spam + oversized), ExploitGuard (suspicious name), ToolGuard (equip spam).

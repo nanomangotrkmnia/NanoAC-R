@@ -3,7 +3,7 @@
 	Flags climbing vertical walls without a ladder/truss. A Spider hack sustains upward speed
 	while pressed against a solid wall.
 
-	Hybrid threading like Phase: the SERIAL phase gathers each airborne player, builds the
+	Hybrid threading like Phase(A): the SERIAL phase gathers each airborne player, builds the
 	raycast exclusion list (not allowed in parallel), then task.desynchronize() casts four
 	horizontal probes for a nearby solid wall. Climbing an actual ladder sets the Humanoid
 	Climbing state (state.climb), which the Coordinator publishes and which exempts the player,
