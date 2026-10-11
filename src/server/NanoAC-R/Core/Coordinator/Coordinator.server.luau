@@ -646,6 +646,7 @@ local function newRecord(plr)
 		swimInAir = false,
 		humanoidCount = 1,
 		physCount = 0,
+		inSolid = false,
 		vel = Vector3.zero,
 		angVel = Vector3.zero,
 		angSpeed = 0,
@@ -1135,11 +1136,21 @@ local function setback(rec)
 	rec.stateTable.exemptUntil = rec.exemptUntil
 	rec.stateTable.setbackCount = rec.setbacks
 
+	-- Force server ownership briefly: a cheating client that keeps writing its own
+	-- CFrame (noclip / CFrame-walk) would otherwise overwrite the setback instantly.
+	pcall(function() root:SetNetworkOwner(nil) end)
+
 	local target = CFrame.new(rec.lastValidPos) * CFrame.Angles(0, rec.lastValidYaw or 0, 0)
 	pcall(function()
 		char:PivotTo(target)
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+
+	task.delay(0.3, function()
+		if root.Parent ~= nil and not root.Anchored then
+			pcall(function() root:SetNetworkOwner(rec.player) end)
+		end
 	end)
 
 	if Settings.Debug then
@@ -1156,7 +1167,11 @@ local function handleViolation(vrec, t)
 	if rec == nil then return end
 	if not Settings.Enabled then return end
 	if isWhitelisted(rec.player) then return end
-	if t < rec.graceUntil or t < rec.exemptUntil then return end
+	if vrec.detail == "body inside solid" then
+		if t < rec.graceUntil then return end
+	else
+		if t < rec.graceUntil or t < rec.exemptUntil then return end
+	end
 
 	local check = vrec.check
 	local cfg = Settings.Checks[check]
@@ -1426,9 +1441,11 @@ local function sample(rec, t)
 	local exempt = t < rec.exemptUntil
 	local moved = rec.prevSamplePos ~= nil and (pos - rec.prevSamplePos).Magnitude or 1
 	rec.prevSamplePos = pos
+	local inSolid = overlapsSolid(pos, char)
+	st.inSolid = inSolid
 	local recentlyFlagged = Settings.Setback.FreezeSafeSpotOnFlag and rec.lastFlagTime ~= nil and (t - rec.lastFlagTime) <= 0.75
 	if supported and not inGrace and not exempt and moved > 0.25 and not recentlyFlagged then
-		if not overlapsSolid(pos, char) then
+		if not inSolid then
 			rec.lastValidPos = pos
 			rec.lastValidYaw = yawOf(root)
 			rec.lastValidTime = t

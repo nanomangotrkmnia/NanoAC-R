@@ -35,6 +35,7 @@ local roster = Shared.roster
 
 local streak = {}    -- [userId] = number
 local lastEmit = {}  -- [userId] = number
+local solidStreak = {} -- [userId] = number (frames spent inside a solid part)
 
 local disabled = false
 local errors = 0
@@ -127,6 +128,23 @@ RunService.PreSimulation:Connect(function()
 				local t = state.time
 				local origin = state.lastValidPos
 				local originT = state.lastValidTime
+				-- Inside-solid detection: a body embedded in a solid part is phasing, no matter
+				-- how the client disables collision (a client-side noclip never replicates
+				-- CanCollide to the server, so this is the authoritative signal).
+				if t ~= nil and t > 0 and state.inSolid == true
+					and state.dead ~= true and state.alive ~= false then
+					solidStreak[userId] = (solidStreak[userId] or 0) + 1
+				else
+					solidStreak[userId] = math.max(0, (solidStreak[userId] or 0) - 1)
+				end
+				if solidStreak[userId] >= Shared.cfg("phaseAInsideStreak", 2) then
+					local cd = Shared.cfg("phaseAEmitCooldown", 0.6)
+					if t ~= nil and (t - (lastEmit[userId] or -math.huge)) >= cd then
+						Shared.flag(userId, CHECK, 0, "body inside solid")
+						lastEmit[userId] = t
+						solidStreak[userId] = 0
+					end
+				end
 				if pos ~= nil and t ~= nil and t > 0
 					and origin ~= nil and originT ~= nil and originT > 0
 					and state.dead ~= true and state.alive ~= false
@@ -134,7 +152,7 @@ RunService.PreSimulation:Connect(function()
 					local dt = t - originT
 					local len = (pos - origin).Magnitude
 					local walk = state.walkSpeed or 16
-					if dt > 0 and len >= minMove and len <= maxSeg and (len / dt) <= walk * factor then
+					if dt > 0 and len >= minMove and len <= maxSeg then
 						local char = plr.Character
 						if char ~= nil then
 							local params = RaycastParams.new()

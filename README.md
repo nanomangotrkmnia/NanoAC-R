@@ -120,7 +120,7 @@ lastValidPos (Vector3), lastValidYaw, lastValidTime, setbackCount`, plus the ext
 maxHealthBase, hitbox, hitboxBase, accessory, accessoryBase, hrpCanCollide, limbNoCollide,
 noCollision, platformStand, flying, flyingEnabled(+Base), deadDisabled(+Base),
 freefallDisabled(+Base), strafingNoPhysics, sitNoSeat, swimInAir, humanoidCount, physCount,
-vel (Vector3), angVel (Vector3), angSpeed, whitelisted, strikes`.
+inSolid, vel (Vector3), angVel (Vector3), angSpeed, whitelisted, strikes`.
 Only SharedTable-compatible types are stored (numbers, booleans, strings, `Vector3`, nested
 SharedTables); CFrames are stored as a position + a yaw scalar.
 
@@ -131,25 +131,35 @@ queue's `write`/`read` to `0` at load, and drains them each frame.
 
 ## 3. Movement & flight checks
 
-### Phase(A) (through-wall) — `Movement/PhaseA`
+### Phase(A) (through-wall + in-solid) — `Movement/PhaseA`
 Casts a ray from the last safe position to the current position and a second ray backwards. When
 both hit the **same** obstacle, the thickness crossed is `len - forwardDistance - backDistance`;
 a positive thickness that is a meaningful fraction of the segment means the path went fully
-through the wall. Ignores thin/steppable, non-collidable, invisible parts, other characters and
-water; ignores corner clipping; defers to Movement(B)/Teleport when the player moved fast enough to
-tunnel legitimately.
+through the wall. It evaluates every crossing (no speed defer to Movement(B)/Teleport), ignoring
+thin/steppable, non-collidable, invisible parts, other characters, water and corner clipping.
+
+It also flags a body **embedded in a solid part** (`state.inSolid`, published by the Coordinator
+each frame). This is the authoritative signal against a client-side noclip: a client setting
+`CanCollide = false` on its own parts never replicates that property to the server (the server
+still reads `true`), so the collision-off guard cannot see it — but the body entering the wall
+can. That "body inside solid" flag deliberately bypasses the setback grace window (spawn grace
+still applies), since a walk-through stays inside a 2-stud wall for barely longer than the grace.
 
 ### Phase(B) (collision) — `Movement/PhaseB`
 Flags a character whose collision has been removed: `HumanoidRootPart.CanCollide == false`, an
 HRP-parented `NoCollisionConstraint` (the modern rig's accessory `NoCollisionConstraint`s live on
-limbs and are ignored), or a body limb with `CanCollide == false`. This is the collision-off side
-of phasing that `Phase(A)` (which catches actually passing **through** geometry) does not see.
+limbs and are ignored), or a body limb with `CanCollide == false`. It only sees server-replicated
+collision values — a purely client-side `CanCollide = false` never reaches the server, so that
+case is covered by Phase(A)'s in-solid test instead.
 
 ### Movement(A) (CFrame-walk) — `Movement/MovementA`
 Compares windowed displacement against the integral of `AssemblyLinearVelocity`. A client that
 writes its CFrame directly (or suppresses velocity while noclip-drifting) moves far more than its
 real velocity explains, even if the displacement stays under the WalkSpeed baseline — so this
 catches the movement that Movement(B) alone cannot see. Ping-scaled, streaked, exempts states.
+Airborne/jumping frames are skipped so a legitimate jump never false-flags; for the same reason
+(server-side `AssemblyLinearVelocity` is unreliable for client-owned characters) it only judges
+grounded motion.
 
 ### Movement(B) (speed) — `Movement/MovementB`
 Horizontal displacement / `dt` versus `WalkSpeed * MaxMultiplier + ping allowance`, confirmed by
@@ -307,8 +317,13 @@ validate from the parallel phase. Without the reporting calls the combat/rate ch
      `<username> failed <Check> VL:<times> Times` (e.g. `Builderman failed Movement(B) VL:5 Times`).
   2. A **setback** teleports the player to the last verified safe, supported CFrame and zeroes
      their linear and angular velocity, then arms a cooldown + grace window so setbacks cannot
-     loop. By default `Setback.OnEveryFlag = true`, so **any** flag sets the player back (bounded
-     by `Setback.Cooldown`); set it to `false` to only setback on VL-threshold crossings.
+     loop. It briefly takes **server network ownership** of the character
+     (`SetNetworkOwner(nil)`, restored after ~0.3s) so a cheating client that keeps writing its
+     own CFrame cannot instantly overwrite the correction. By default `Setback.OnEveryFlag = true`,
+     so **any** flag sets the player back (bounded by `Setback.Cooldown`); set it to `false` to
+     only setback on VL-threshold crossings.
+* A violation whose detail is `"body inside solid"` (Phase(A)) is handled even inside an
+  `exemptUntil` window — only the spawn grace still suppresses it.
 * **BanManager**: each threshold crossing also adds a strike. Strikes decay at
   `BanManager.StrikeDecayPerSecond`; at `WarnAt` the player is warned, at `KickAt` they are
   kicked and (optionally persisted to a DataStore) temporarily rejoin-banned for
@@ -353,8 +368,11 @@ Tested in Studio (Play Solo) on this place:
 
 * The Coordinator samples every `PostSimulation`, publishes the roster/config, and drains every
   queue each frame — no `[NanoAC-R] ... error` lines.
-* Idle at spawn and real engine-driven **walking + jumping produced zero** flags
-  (`queue.write` stayed at 0/40 while the character moved ~126 studs).
+* Idle at spawn and real engine-driven **walking + jumping produced zero** flags.
+* A client that sets its own parts `CanCollide = false` with no wall involved is **not** flagged:
+  `CanCollide` on a client-owned character never replicates (the server still reads `true`).
+* Walking straight through a wall with noclip **is** flagged — Phase(A) fires `body inside solid`
+  and the network-ownership setback contains the character instead of it phasing through.
 * Tamper tests each produced flags: Humanoid (WalkSpeed/JumpPower), Phase(B) (HRP collision),
   Hitbox (HRP/limb growth), Health (MaxHealth, heal burst; a **reported** heal is credited and
   does **not** flag), Integrity (Dead disabled, extra Humanoid), UnexpectedMove(A) (LinearVelocity),
@@ -379,8 +397,11 @@ The test/debug affordances are **off** in this build:
 | client `/speed`, `/fly` hacks | **removed** |
 | `Setback.OnEveryFlag` | `true` — every flag sets the player back (now the norm) |
 
-`Workspace.NanoAC_TestMap` (a labelled test ground around `(200, 0, 0)`) is not part of the Rojo
-project and can be deleted; it is a plain Folder of anchored parts.
+`Workspace.NanoAC_TestMap` is not part of the Rojo project and can be deleted. In this place it
+holds a labelled pad lab plus a `NanoAC_TestHarness` (server Script) and a `NanoAC_TestGUI`
+(LocalScript under `StarterPlayerScripts`) that fire one cheat per check — walk on a `PAD_<id>`
+or use the on-screen panel (live flag log, and a **Phase** toggle that enables real client-side
+noclip). These are studio-only test scripts and are **not** included by the Rojo build.
 
 ---
 
